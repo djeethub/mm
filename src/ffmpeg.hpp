@@ -1,7 +1,6 @@
 #pragma once
 
 #include <string>
-#include <unordered_set>
 #include <format>
 
 extern "C" {
@@ -206,7 +205,8 @@ public:
             close();
             return false;
         }
-        start_time = format_ctx->start_time == AV_NOPTS_VALUE ? 0.0 : static_cast<double>(format_ctx->start_time) * AV_TIME_BASE;
+//        start_time = format_ctx->start_time == AV_NOPTS_VALUE ? 0.0 : static_cast<double>(format_ctx->start_time) / AV_TIME_BASE;
+        start_time = 0;
         duration = format_ctx->duration == AV_NOPTS_VALUE ? LARGE_INTERVAL : static_cast<double>(format_ctx->duration) / AV_TIME_BASE;
         if (!packet) packet = av_packet_alloc();
         if (!frame) frame = frame_pool.alloc();
@@ -398,62 +398,11 @@ public:
         return true;
     }
 
-    bool setup_swr_context()
-    {
-        // Explicitly define a 2-channel Stereo Layout for the destination
-        AVChannelLayout stereo_layout;
-        av_channel_layout_default(&stereo_layout, 2);
-
-        // Setup SwrContext to convert whatever the video has into raw packed S16 Stereo PCM
-        int swr_err = swr_alloc_set_opts2(&swr_ctx,
-                                          &stereo_layout, AV_SAMPLE_FMT_S16, 44100,                                               // Destination: Packed 16-bit, 44100Hz Stereo
-                                          &audio_codec_ctx->ch_layout, audio_codec_ctx->sample_fmt, audio_codec_ctx->sample_rate, // Source: Movie Native Settings
-                                          0, nullptr);
-
-        if (swr_err < 0 || swr_init(swr_ctx) < 0)
-        {
-            SDL_Log("Failed to initialize SwrContext conversion engine!");
-            return false;
-        }
-        return true;
-    }
-
-    void convert_audio_frame(AVFrame *frame, AudioBuffer *audio_buf)
-    {
-        // 1. Calculate max potential samples we will get after conversion
-        int out_samples = av_rescale_rnd(
-            swr_get_delay(swr_ctx, 44100) + frame->nb_samples,
-            44100,
-            audio_codec_ctx->sample_rate,
-            AV_ROUND_UP);
-
-        // 2. Allocate pointers for the destination buffer (2 channels, S16 format)
-        audio_buf->init(out_samples);
-
-        // 3. Perform the actual conversion safely
-        int converted_samples = swr_convert(
-            swr_ctx,
-            &audio_buf->buf,
-            out_samples,
-            (const uint8_t **)frame->data,
-            frame->nb_samples);
-
-        if (converted_samples > 0)
-        {
-            // Calculate the exact size of the resulting packed bytes
-            // 2 channels * number of converted samples * 2 bytes per sample (S16)
-            audio_buf->data_size = converted_samples * 2 * sizeof(int16_t);
-        }
-        else
-            audio_buf->data_size = 0;
-    }
-
     void close() {
         avcodec_free_context(&audio_codec_ctx);
         avcodec_free_context(&video_codec_ctx);
         avcodec_free_context(&subtitle_codec_ctx);
         avformat_close_input(&format_ctx);
-        swr_free(&swr_ctx);
         audio_stream_index = -1;
         video_stream_index = -1;
         subtitle_stream_idx = -1;
@@ -727,7 +676,6 @@ public:
 private:
     AVFormatContext* format_ctx = nullptr;
     AVCodecContext* audio_codec_ctx = nullptr;
-    SwrContext* swr_ctx = nullptr;
     int audio_stream_index = -1;
     AVCodecContext* video_codec_ctx = nullptr;
     int video_stream_index = -1;

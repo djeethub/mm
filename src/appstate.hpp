@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <future>
 #include <variant>
+#include <flat_set>
 
 #include "ffmpeg.hpp"
 #include "subtitle.hpp"
@@ -43,9 +44,9 @@ struct DirData {
 class AppState {
 private:
     SDL_AudioStream *audio_stream = nullptr;
-    static inline const std::unordered_set<std::string> video_exts = { ".mp4", ".mkv", ".mov", ".flv", ".wmv", ".webm", ".avi" };
-    static inline const std::unordered_set<std::string> image_exts = { ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".jfif" };
-    static inline const std::unordered_set<std::string> sound_exts = { ".mp3", ".flac", ".opus", ".wav", ".ogg", ".ape", ".tta", ".mpa", ".wma", ".aac" };
+    static inline const std::flat_set<std::string> video_exts = { ".mp4", ".mkv", ".mov", ".flv", ".wmv", ".webm", ".avi" };
+    static inline const std::flat_set<std::string> image_exts = { ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".jfif" };
+    static inline const std::flat_set<std::string> sound_exts = { ".mp3", ".flac", ".opus", ".wav", ".ogg", ".ape", ".tta", ".mpa", ".wma", ".aac" };
     std::future<DirData *> dir_future;
     double seek_time;
     AVSubtitleType sub_type;
@@ -635,7 +636,7 @@ public:
     }
 
     auto get_file_name() {
-        return current_index >= 0 ? image_files[current_index] : nullptr;
+        return current_index >= 0 ? image_files[current_index] : "n/a";
     }
 
     void select_subtitle(int idx) {
