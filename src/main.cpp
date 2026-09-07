@@ -258,6 +258,8 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
 SDL_AppResult SDL_AppIterate(void *appstate) {
     auto *state = static_cast<AppState*>(appstate);
 
+    state->gpu.rebuild();
+
     auto app_result = gui.draw();
     if (app_result != SDL_APP_CONTINUE)
         return app_result;
@@ -271,7 +273,7 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     if (state) {
         SDL_SetWindowHitTest(state->window, nullptr, nullptr);
         state->shutdown();
-        SDL_WaitForGPUIdle(state->gpu.get_device());
+        state->gpu.wait_for_idle();
         gui.shutdown();
         delete state;
     }

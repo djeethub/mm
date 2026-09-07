@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(PkgConfig REQUIRED)
 find_package(SDL3 REQUIRED)
+find_package(Vulkan REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavformat libswresample libavutil libswscale)
 pkg_check_modules(LIBASS REQUIRED IMPORTED_TARGET libass)
 #find_package(Fontconfig REQUIRED)
@@ -19,7 +20,7 @@ set(IMGUI_SRCS
     ${IMGUI_DIR}/imgui_tables.cpp
     ${IMGUI_DIR}/imgui_widgets.cpp
     ${IMGUI_DIR}/backends/imgui_impl_sdl3.cpp
-    ${IMGUI_DIR}/backends/imgui_impl_sdlgpu3.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp
 )
 # Create a static library target named 'my_imgui' entirely inside this scope
 add_library(my_imgui STATIC ${IMGUI_SRCS})
@@ -104,10 +105,9 @@ target_include_directories(main PRIVATE
 
 target_link_libraries(main PRIVATE
     SDL3::SDL3
+    Vulkan::Vulkan
     my_imgui
     PkgConfig::FFMPEG
     PkgConfig::LIBASS
 #    Fontconfig::Fontconfig
 )
-
-message(STATUS "CMake Search Paths: ${CMAKE_PREFIX_PATH}")

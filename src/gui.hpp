@@ -6,7 +6,7 @@
 #include <SDL3/SDL.h>
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
-#include <imgui_impl_sdlgpu3.h>
+#include <imgui_impl_vulkan.h>
 
 //#include <fontconfig/fontconfig.h>
 
@@ -19,7 +19,7 @@ class AppGui {
         void shutdown() {
             if (state) {
                 state = nullptr;
-                ImGui_ImplSDLGPU3_Shutdown();
+                ImGui_ImplVulkan_Shutdown();
                 ImGui_ImplSDL3_Shutdown();
                 ImGui::DestroyContext();
             }
@@ -78,9 +78,19 @@ class AppGui {
             // Initialize Dear ImGui Context
             IMGUI_CHECKVERSION();
             ImGui::CreateContext();
-            ImGuiIO &io = ImGui::GetIO();
+            ImGuiIO &io = ImGui::GetIO(); (void)io;
             io.IniFilename = NULL; // Disable default ini handling
             ImGui::StyleColorsDark();
+
+            // Setup scaling
+            float main_scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+            ImGuiStyle& style = ImGui::GetStyle();
+            style.ScaleAllSizes(main_scale);        // Bake a fixed style scale. (until we have a solution for dynamic style scaling, changing this requires resetting Style + calling this again)
+            style.FontScaleDpi = main_scale;        // Set initial font scale. (in docking branch: using io.ConfigDpiScaleFonts=true automatically overrides this for every window depending on the current monitor)
+
+            // Setup Platform/Renderer backends
+            ImGui_ImplSDL3_InitForVulkan(state->window);
+            state->gpu.imgui_init();
 
             // 3. Load the fonts from your local system or project directory
             // Arguments: (Filepath, Font Size in pixels, Config Struct, Glyph Ranges)
@@ -100,18 +110,9 @@ class AppGui {
             }*/
 
             // 4. Fallback safeguard: If files are missing, default back to ProggyClean safely
-            if (uiFont == nullptr)  uiFont  = io.Fonts->AddFontDefaultVector();
-            if (osdFont == nullptr) osdFont = io.Fonts->AddFontDefaultVector();
+//            if (uiFont == nullptr)  uiFont  = io.Fonts->AddFontDefaultVector();
+//            if (osdFont == nullptr) osdFont = io.Fonts->AddFontDefaultVector();
 //            if (subtitleFont == nullptr) subtitleFont = io.Fonts->AddFontDefault();            
-
-            // Setup Platform/Renderer Backends
-            ImGui_ImplSDL3_InitForSDLGPU(state->window);
-            ImGui_ImplSDLGPU3_InitInfo init_info = {
-                .Device = state->gpu.get_device(),
-                .ColorTargetFormat = SDL_GetGPUSwapchainTextureFormat(state->gpu.get_device(), state->window),
-                .MSAASamples = SDL_GPU_SAMPLECOUNT_1,
-            };
-            ImGui_ImplSDLGPU3_Init(&init_info);
         }
 
         static void DrawTextWithOutline(ImDrawList* draw_list, ImFont* font, float font_size, ImVec2 screen_pos, const char* text, ImU32 text_color, ImU32 outline_color, float stroke_thickness) {
@@ -151,8 +152,8 @@ class AppGui {
             auto curr_ticks = SDL_GetTicks();
             ImGuiIO &io = ImGui::GetIO();
 
-            // Start ImGui Frame Rendering Chain
-            ImGui_ImplSDLGPU3_NewFrame();
+            // Start the Dear ImGui frame
+            ImGui_ImplVulkan_NewFrame();
             ImGui_ImplSDL3_NewFrame();
             ImGui::NewFrame();
 

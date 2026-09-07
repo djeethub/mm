@@ -14,7 +14,7 @@
 #include "subtitle.hpp"
 #include "ass.hpp"
 #include "sub_bitmap.hpp"
-#include "gpu.hpp"
+#include "vulkan.hpp"
 #include "readerwriterqueue.h"
 
 const auto LARGE_INTERVAL = 777777.7;
@@ -58,7 +58,7 @@ public:
     std::string parent_dir;
     SDL_Window *window = nullptr;
     ff::VideoFile video;
-    AppGpu gpu;
+    AppVk gpu;
     AppSub app_sub;
     std::vector<ff::ChapterData> chapter_list;
     bool is_seeking = false;
@@ -73,7 +73,7 @@ public:
 
     bool init() {
         Uint32 window_flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_BORDERLESS | SDL_WINDOW_HIDDEN;
-        window = SDL_CreateWindow("mm", 480, 240, window_flags);
+        window = SDL_CreateWindow("mm", 480, 240, window_flags | SDL_WINDOW_VULKAN);
         if (!window) { return false; }
 
         return gpu.init(window);
@@ -492,10 +492,11 @@ public:
                         if (sub)
                             delete sub;
                     }, app_sub);
-                    sub = new SubAss(gpu.get_device());
+//                    sub = new SubAss(gpu.get_device());
+                    sub = nullptr;
                     app_sub = sub;
                 }
-                sub->init(target_w, target_h, video.get_subtitle_ctx(), video.get_format_ctx(), window);
+//                sub->init(target_w, target_h, video.get_subtitle_ctx(), video.get_format_ctx(), window);
             }
                 break;
 
@@ -510,7 +511,8 @@ public:
                         if (sub)
                             delete sub;
                     }, app_sub);
-                    sub = new SubBitmap(gpu.get_device());
+//                    sub = new SubBitmap(gpu.get_device());
+                    sub = nullptr;
                     app_sub = sub;
                 }
                 sub->init(video.get_subtitle_ctx(), window);
@@ -537,7 +539,7 @@ public:
                 switch (rect->type) {
                     case SUBTITLE_ASS:
                         if (rect->ass) {
-                            std::get<SubAss *>(app_sub)->add_ass(rect->ass, static_cast<long long>(sub->frame_time * 1000), static_cast<long long>(sub->duration * 1000));
+//                            std::get<SubAss *>(app_sub)->add_ass(rect->ass, static_cast<long long>(sub->frame_time * 1000), static_cast<long long>(sub->duration * 1000));
                         }
                         break;
                     case SUBTITLE_BITMAP:
@@ -674,7 +676,9 @@ public:
             auto play_time = get_play_time();
             auto video_frame = check_video_frame(play_time);
             if (video_frame) {
-                gpu.set_frame(video_frame, play_time, app_sub);
+                ff::frame_recycle(video_frame);
+                video_frame = nullptr;
+//                gpu.set_frame(video_frame, play_time, app_sub);
             } else if (video.is_eof.load(std::memory_order_relaxed)) {
                 auto duration = video.get_duration();
                 if (duration <= play_time) {
