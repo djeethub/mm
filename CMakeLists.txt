@@ -9,7 +9,12 @@ find_package(PkgConfig REQUIRED)
 find_package(SDL3 REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavformat libswresample libavutil libswscale)
 pkg_check_modules(LIBASS REQUIRED IMPORTED_TARGET libass)
+pkg_check_modules(VAAPI REQUIRED IMPORTED_TARGET libva libva-drm)
 #find_package(Fontconfig REQUIRED)
+
+find_package(Threads REQUIRED)
+set(Dawn_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dawn/lib64/cmake/Dawn")
+find_package(Dawn REQUIRED)
 
 # Define ImGui static source group
 set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/imgui)
@@ -19,7 +24,7 @@ set(IMGUI_SRCS
     ${IMGUI_DIR}/imgui_tables.cpp
     ${IMGUI_DIR}/imgui_widgets.cpp
     ${IMGUI_DIR}/backends/imgui_impl_sdl3.cpp
-    ${IMGUI_DIR}/backends/imgui_impl_sdlgpu3.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_wgpu.cpp
 )
 # Create a static library target named 'my_imgui' entirely inside this scope
 add_library(my_imgui STATIC ${IMGUI_SRCS})
@@ -41,6 +46,7 @@ set(SHADER_SOURCES
     shaders/yuyv.frag
     shaders/ya.frag
     shaders/yuva.frag
+    shaders/nv12_ext.frag
 )
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -85,7 +91,8 @@ target_include_directories(my_imgui PUBLIC
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
 )
-target_link_libraries(my_imgui PRIVATE SDL3::SDL3)
+target_compile_definitions(my_imgui PRIVATE IMGUI_IMPL_WEBGPU_BACKEND_DAWN=1)
+target_link_libraries(my_imgui PRIVATE SDL3::SDL3 dawn::webgpu_dawn)
 
 add_executable(main WIN32
     src/main.cpp
@@ -93,7 +100,6 @@ add_executable(main WIN32
 add_dependencies(main CompileShaders)
 
 target_compile_definitions(main PRIVATE SDL_MAIN_USE_CALLBACKS=1)
-
 target_include_directories(main PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}/vendor/imgui
     ${CMAKE_CURRENT_SOURCE_DIR}/vendor/imgui/backends
@@ -105,9 +111,11 @@ target_include_directories(main PRIVATE
 target_link_libraries(main PRIVATE
     SDL3::SDL3
     my_imgui
+#    Fontconfig::Fontconfig
+    dawn::webgpu_dawn
     PkgConfig::FFMPEG
     PkgConfig::LIBASS
-#    Fontconfig::Fontconfig
+    PkgConfig::VAAPI
+#    dawn::dawn_native
+#    dawn::dawn_proc    
 )
-
-message(STATUS "CMake Search Paths: ${CMAKE_PREFIX_PATH}")

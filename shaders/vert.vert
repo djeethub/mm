@@ -1,7 +1,7 @@
 #version 450
 
 // Push uniform block (Slot 0)
-layout(std140, set = 1, binding = 0) uniform TransformBlock {
+layout(std140, set = 0, binding = 0) uniform TransformBlock {
     vec2 u_position; // Center or Top-Left position in Normalized Device Coordinates (-1..1)
     vec2 u_size;     // Width and Height in NDC space
 } transform;

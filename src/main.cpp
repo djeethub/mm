@@ -271,7 +271,7 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     if (state) {
         SDL_SetWindowHitTest(state->window, nullptr, nullptr);
         state->shutdown();
-        SDL_WaitForGPUIdle(state->gpu.get_device());
+//        SDL_WaitForGPUIdle(state->gpu.get_device());
         gui.shutdown();
         delete state;
     }
