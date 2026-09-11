@@ -1,12 +1,12 @@
 #version 450
 
 // Texture bindings (Set 1)
-layout(set = 1, binding = 0) uniform texture2D u_tex_y;
-layout(set = 1, binding = 1) uniform texture2D u_tex_uv;
-layout(set = 1, binding = 2) uniform sampler   u_sampler;
+layout(set = 1, binding = 0) uniform sampler   u_sampler;
+layout(set = 1, binding = 1) uniform texture2D u_tex_y;
+layout(set = 1, binding = 2) uniform texture2D u_tex_uv;
 
 // Dawn's injected metadata uniform
-layout(std140, set = 1, binding = 3) uniform ExternalTextureParams {
+layout(set = 1, binding = 3) uniform ExternalTextureParams {
     mat4 colorConversionMatrix;
     vec2 uvMin;
     vec2 uvMax;

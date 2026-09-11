@@ -185,8 +185,8 @@ struct Uniforms {
 @group(0) @binding(1) var<uniform> uf : Uniforms;
 
 // Textures & Samplers (Split from sampler2D)
-@group(1) @binding(0) var mySampler: sampler; 
-@group(1) @binding(1) var myVideoTexture: texture_external;
+@group(0) @binding(2) var mySampler: sampler; 
+@group(1) @binding(0) var myVideoTexture: texture_external;
 
 @fragment
 fn main(in: VertexOutput) -> @location(0) vec4<f32> {
@@ -194,28 +194,32 @@ fn main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 )";
 
-static const char __test_frag_wgsl[] = R"(
+static const char __nv12_frag_wgsl[] = R"(
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
 };
 
-struct Uniforms {
-    tex_size    : vec2<f32>,
-    color_range : i32, // 2 = jpeg, 1 = mpeg
-    colorspace  : i32, // 2 = BT.601, 1 = BT.709, 9/10 = BT.2020
-}
-
-// Uniform binding
-@group(0) @binding(1) var<uniform> uf : Uniforms;
-
-// Textures & Samplers (Split from sampler2D)
-@group(1) @binding(0) var mySampler: sampler; 
-@group(1) @binding(1) var myVideoTexture: texture_external;
+@group(0) @binding(2) var samp  : sampler;
+@group(1) @binding(0) var yTex  : texture_2d<f32>;
+@group(1) @binding(1) var uvTex : texture_2d<f32>;   // or separate u/v
 
 @fragment
 fn main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSampleBaseClampToEdge(myVideoTexture, mySampler, in.uv);
-//    return vec4<f32>(in.uv.x, in.uv.y, 0.0, 1.0);
+    let y  = textureSample(yTex,  samp, in.uv).r;
+    let uv = textureSample(uvTex, samp, in.uv).rg;   // for NV12
+
+    // BT.709 limited-range (common for video)
+    let yy = y - 0.0625;
+    let uu = uv.x - 0.5;
+    let vv = uv.y - 0.5;
+
+    let r = yy + 1.5748 * vv;
+    let g = yy - 0.1873 * uu - 0.4681 * vv;
+    let b = yy + 1.8556 * uu;
+
+//    return vec4f(clamp(vec3f(r, g, b), vec3f(0.0), vec3f(1.0)), 1.0);
+//    return vec4f(uv.r, uv.g, 0.0, 1.0);
+    return vec4f(r, g, b, 1.0);
 }
 )";

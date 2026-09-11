@@ -9,11 +9,13 @@ find_package(PkgConfig REQUIRED)
 find_package(SDL3 REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavformat libswresample libavutil libswscale)
 pkg_check_modules(LIBASS REQUIRED IMPORTED_TARGET libass)
-pkg_check_modules(VAAPI REQUIRED IMPORTED_TARGET libva libva-drm)
+if(NOT WIN32)
+    pkg_check_modules(VAAPI REQUIRED IMPORTED_TARGET libva libva-drm)
+endif()
 #find_package(Fontconfig REQUIRED)
 
 find_package(Threads REQUIRED)
-set(Dawn_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dawn/lib64/cmake/Dawn")
+set(Dawn_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/dawn/linux/lib64/cmake/Dawn")
 find_package(Dawn REQUIRED)
 
 # Define ImGui static source group
@@ -115,7 +117,12 @@ target_link_libraries(main PRIVATE
     dawn::webgpu_dawn
     PkgConfig::FFMPEG
     PkgConfig::LIBASS
-    PkgConfig::VAAPI
 #    dawn::dawn_native
 #    dawn::dawn_proc    
 )
+
+if (NOT WIN32)
+    target_link_libraries(main PRIVATE
+        PkgConfig::VAAPI
+    )
+endif()

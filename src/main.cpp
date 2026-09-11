@@ -110,33 +110,31 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
                     }
                     break;
                 case SDLK_KP_9:
-                    state->gpu.video_scale += SCALE_N;
+                    state->gpu.scale(SCALE_N);
                     gui.show_noti(std::format("Video Scale: {:.2f}", state->gpu.video_scale));
                     break;
                 case SDLK_KP_1:
-                    state->gpu.video_scale -= SCALE_N;
+                    state->gpu.scale(-SCALE_N);
                     gui.show_noti(std::format("Video Scale: {:.2f}", state->gpu.video_scale));
                     break;
                 case SDLK_KP_5:
-                    state->gpu.video_pan_x = 0;
-                    state->gpu.video_pan_y = 0;
-                    state->gpu.video_scale = 1;
+                    state->gpu.reset_transform();
                     gui.show_noti("Video Reset");
                     break;
                 case SDLK_KP_4:
-                    state->gpu.video_pan_x -= PAN_N;
+                    state->gpu.pan_x(-PAN_N);
                     gui.show_noti(std::format("Video Pan X: {}", state->gpu.video_pan_x));
                     break;
                 case SDLK_KP_6:
-                    state->gpu.video_pan_x += PAN_N;
+                    state->gpu.pan_x(PAN_N);
                     gui.show_noti(std::format("Video Pan X: {}", state->gpu.video_pan_x));
                     break;
                 case SDLK_KP_8:
-                    state->gpu.video_pan_y += PAN_N;
+                    state->gpu.pan_y(PAN_N);
                     gui.show_noti(std::format("Video Pan Y: {}", state->gpu.video_pan_y));
                     break;
                 case SDLK_KP_2:
-                    state->gpu.video_pan_y -= PAN_N;
+                    state->gpu.pan_y(PAN_N);
                     gui.show_noti(std::format("Video Pan Y: {}", state->gpu.video_pan_y));
                     break;
                 case SDLK_1:

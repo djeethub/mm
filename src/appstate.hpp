@@ -76,7 +76,9 @@ public:
         window = SDL_CreateWindow("mm", 480, 240, window_flags);
         if (!window) { return false; }
 
-        return gpu.init(window);
+        bool rlt = gpu.init(window);
+        video.zero_p010 = gpu.zero_p010;
+        return rlt;
     }
 
     static MediaMode is_supported_format(const fs::path &p, MediaMode mode = None) {

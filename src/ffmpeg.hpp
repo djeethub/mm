@@ -189,6 +189,8 @@ public:
     std::atomic<double> shared_tick;
     std::atomic<bool> is_eof;
     bool video_available;
+    bool zero_p010 = false;
+    int zero_supported = -1;
 
     bool open(const std::string &filename)
     {
@@ -212,6 +214,7 @@ public:
         if (!frame) frame = frame_pool.alloc();
         last_audio_time = start_time;
         last_video_time = start_time;
+        zero_supported = -1;
         return true;
     }
 
@@ -571,14 +574,17 @@ public:
                                 set_seeking(false);
                             }
                             auto new_frame = frame_alloc();
-/*                            if (frame->hw_frames_ctx) {
+                            if (zero_supported < 0)
+                                //zero_supported = get_zero_supported(video_codec_ctx->sw_pix_fmt) ? 1 : 0;
+                                zero_supported = 0;
+                            if (frame->hw_frames_ctx && !zero_supported) {
                                 auto err = av_hwframe_transfer_data(new_frame, frame, 0);
                                 if (err) av_err_log("av_hwframe_transfer_data", err);
                                 av_frame_copy_props(new_frame, frame);
                             }
-                            else {*/
+                            else {
                                 av_frame_move_ref(new_frame, frame);
-//                            }
+                            }
                             video_frame_queue.enqueue(new_frame);
                         }
                         av_frame_unref(frame);
@@ -695,5 +701,13 @@ private:
     std::thread thread;
     double last_video_time;
     double last_audio_time;
+
+    bool get_zero_supported(AVPixelFormat fmt) {
+        auto fmt_desc = av_pix_fmt_desc_get(fmt);
+        if (!zero_p010) {
+            return fmt_desc->comp[0].depth <= 8;
+        }
+        return true;
+    }
 };
 } // namespace ff
