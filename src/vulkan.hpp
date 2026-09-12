@@ -10,6 +10,8 @@ extern "C" {
 #include <libavutil/hwcontext_drm.h>
 }
 
+#include "vk_window.hpp"
+#include "vk_frame.hpp"
 #include "subtitle.hpp"
 
 #include "vert.vert.h"
@@ -86,6 +88,15 @@ public:
 	}
 };
 
+void check_vk_result(VkResult err)
+{
+    if (err == VK_SUCCESS)
+        return;
+    SDL_Log("[vulkan] Error: VkResult = %d\n", err);
+    if (err < 0)
+        abort();
+}
+
 class AppVk {
 private:
     VkAllocationCallbacks*   g_Allocator = nullptr;
@@ -95,27 +106,60 @@ private:
     uint32_t                 g_QueueFamily = (uint32_t)-1;
     VkQueue                  g_Queue = VK_NULL_HANDLE;
     VkPipelineCache          g_PipelineCache = VK_NULL_HANDLE;
-    VkDescriptorPool         g_DescriptorPool = VK_NULL_HANDLE;
 
-    ImGui_ImplVulkanH_Window g_MainWindowData;
     uint32_t                 g_MinImageCount = 2;
     bool                     g_SwapChainRebuild = false;
+    VkWindow vkWindow{};
+    FrameData frameData[1];
+    int frame_idx = 0;
 
-	AVPixelFormat pix_fmt = AV_PIX_FMT_NONE;
-	const AVPixFmtDescriptor *fmt_desc;
-	int width = 0;
-	int height = 0;
-	int de_width = 2;
-	int de_height = 2;
 	int wnd_w = 0;
 	int wnd_h = 0;
 	float base_scale = 0.0;
-	AVFrame *frame = nullptr;
-	int n_bindings = 0;
-	int bpp;
-	XferPool xfer_pool;
+//	XferPool xfer_pool;
 	SwsContext *sws_ctx = nullptr;
-    VkImage image;
+
+    VkPhysicalDevice SelectPhysicalDevice(VkInstance instance)
+    {
+        uint32_t gpu_count;
+        VkResult err = vkEnumeratePhysicalDevices(instance, &gpu_count, nullptr);
+        check_vk_result(err);
+        IM_ASSERT(gpu_count > 0);
+
+        ImVector<VkPhysicalDevice> gpus;
+        gpus.resize(gpu_count);
+        err = vkEnumeratePhysicalDevices(instance, &gpu_count, gpus.Data);
+        check_vk_result(err);
+
+        // If a number >1 of GPUs got reported, find discrete GPU if present, or use first one available. This covers
+        // most common cases (multi-gpu/integrated+dedicated graphics). Handling more complicated setups (multiple
+        // dedicated GPUs) is out of scope of this sample.
+        for (VkPhysicalDevice& device : gpus)
+        {
+            VkPhysicalDeviceProperties properties;
+            vkGetPhysicalDeviceProperties(device, &properties);
+            if (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+                return device;
+        }
+
+        // Use first GPU (Integrated) is a Discrete one is not available.
+        if (gpu_count > 0)
+            return gpus[0];
+        return VK_NULL_HANDLE;
+    }
+
+    static uint32_t SelectQueueFamilyIndex(VkPhysicalDevice physical_device)
+    {
+        uint32_t count;
+        vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &count, nullptr);
+        ImVector<VkQueueFamilyProperties> queues_properties;
+        queues_properties.resize((int)count);
+        vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &count, queues_properties.Data);
+        for (uint32_t i = 0; i < count; i++)
+            if (queues_properties[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)
+                return i;
+        return (uint32_t)-1;
+    }
 
     void SetupVulkan(ImVector<const char*> instance_extensions)
     {
@@ -180,11 +224,11 @@ private:
         }
 
         // Select Physical Device (GPU)
-        g_PhysicalDevice = ImGui_ImplVulkanH_SelectPhysicalDevice(g_Instance);
+        g_PhysicalDevice = SelectPhysicalDevice(g_Instance);
         IM_ASSERT(g_PhysicalDevice != VK_NULL_HANDLE);
 
         // Select graphics queue family
-        g_QueueFamily = ImGui_ImplVulkanH_SelectQueueFamilyIndex(g_PhysicalDevice);
+        g_QueueFamily = SelectQueueFamilyIndex(g_PhysicalDevice);
         IM_ASSERT(g_QueueFamily != (uint32_t)-1);
 
         // Create Logical Device (with 1 queue)
@@ -219,31 +263,9 @@ private:
             check_vk_result(err);
             vkGetDeviceQueue(g_Device, g_QueueFamily, 0, &g_Queue);
         }
-
-        // Create Descriptor Pool
-        // If you wish to load e.g. additional textures you may need to alter pools sizes and maxSets.
-        {
-            VkDescriptorPoolSize pool_sizes[] =
-            {
-                { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, IMGUI_IMPL_VULKAN_MINIMUM_SAMPLED_IMAGE_POOL_SIZE },
-                { VK_DESCRIPTOR_TYPE_SAMPLER, IMGUI_IMPL_VULKAN_MINIMUM_SAMPLER_POOL_SIZE },
-            };
-            VkDescriptorPoolCreateInfo pool_info = {};
-            pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-            pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-            pool_info.maxSets = 0;
-            for (VkDescriptorPoolSize& pool_size : pool_sizes)
-                pool_info.maxSets += pool_size.descriptorCount;
-            pool_info.poolSizeCount = (uint32_t)IM_COUNTOF(pool_sizes);
-            pool_info.pPoolSizes = pool_sizes;
-            err = vkCreateDescriptorPool(g_Device, &pool_info, g_Allocator, &g_DescriptorPool);
-            check_vk_result(err);
-        }
     }
 
-    // All the ImGui_ImplVulkanH_XXX structures/functions are optional helpers used by the demo.
-    // Your real engine/app may not use them.
-    void SetupVulkanWindow(ImGui_ImplVulkanH_Window* wd, VkSurfaceKHR surface, int width, int height)
+    void SetupVulkanWindow(VkWindow *wd, VkSurfaceKHR surface, int width, int height)
     {
         // Check for WSI support
         VkBool32 res;
@@ -258,7 +280,7 @@ private:
         const VkFormat requestSurfaceImageFormat[] = { VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8_UNORM, VK_FORMAT_R8G8B8_UNORM };
         const VkColorSpaceKHR requestSurfaceColorSpace = VK_COLORSPACE_SRGB_NONLINEAR_KHR;
         wd->Surface = surface;
-        wd->SurfaceFormat = ImGui_ImplVulkanH_SelectSurfaceFormat(g_PhysicalDevice, wd->Surface, requestSurfaceImageFormat, (size_t)IM_COUNTOF(requestSurfaceImageFormat), requestSurfaceColorSpace);
+        wd->SurfaceFormat = vkWindow.SelectSurfaceFormat(g_PhysicalDevice, surface, requestSurfaceImageFormat, (size_t)IM_COUNTOF(requestSurfaceImageFormat), requestSurfaceColorSpace);
 
         // Select Present Mode
     #ifdef APP_USE_UNLIMITED_FRAME_RATE
@@ -266,12 +288,12 @@ private:
     #else
         VkPresentModeKHR present_modes[] = { VK_PRESENT_MODE_FIFO_KHR };
     #endif
-        wd->PresentMode = ImGui_ImplVulkanH_SelectPresentMode(g_PhysicalDevice, wd->Surface, &present_modes[0], IM_COUNTOF(present_modes));
+        wd->PresentMode = wd->SelectPresentMode(g_PhysicalDevice, surface, &present_modes[0], IM_COUNTOF(present_modes));
         //printf("[vulkan] Selected PresentMode = %d\n", wd->PresentMode);
 
         // Create SwapChain, RenderPass, Framebuffer, etc.
         IM_ASSERT(g_MinImageCount >= 2);
-        ImGui_ImplVulkanH_CreateOrResizeWindow(g_Instance, g_PhysicalDevice, g_Device, wd, g_QueueFamily, g_Allocator, width, height, g_MinImageCount, 0);
+        wd->CreateOrResizeWindow(g_Instance, g_PhysicalDevice, g_Device, g_QueueFamily, g_Allocator, width, height, g_MinImageCount, 0);
     }
 
     void FrameRender(ImGui_ImplVulkanH_Window* wd, ImDrawData* draw_data)
@@ -339,7 +361,7 @@ private:
         }
     }
 
-    void FramePresent(ImGui_ImplVulkanH_Window* wd)
+    void FramePresent(VkWindow* wd)
     {
         if (g_SwapChainRebuild)
             return;
@@ -361,21 +383,6 @@ private:
         wd->SemaphoreIndex = (wd->SemaphoreIndex + 1) % wd->SemaphoreCount; // Now we can use the next set of semaphores
     }
 
-public:
-    float video_scale = 1.0;
-    float video_pan_x = 0.0;
-    float video_pan_y = 0.0;
-	auto get_pix_fmt() { return AV_PIX_FMT_NONE; }
-
-    static void check_vk_result(VkResult err)
-    {
-        if (err == VK_SUCCESS)
-            return;
-        SDL_Log("[vulkan] Error: VkResult = %d\n", err);
-        if (err < 0)
-            abort();
-    }
-
     static bool IsExtensionAvailable(const ImVector<VkExtensionProperties>& properties, const char* extension)
     {
         for (const VkExtensionProperties& p : properties)
@@ -384,145 +391,21 @@ public:
         return false;
     }
 
-    void set_frame(AVFrame *frame, double play_time, AppSub sub) {
-        if (frame->hw_frames_ctx) {
-            AVDRMFrameDescriptor *drm_desc = (AVDRMFrameDescriptor*)frame->data[0];
-
-            int dma_fd = drm_desc->objects[0].fd; 
-            uint64_t modifier = drm_desc->objects[0].format_modifier; // AMD Tiling information
-
-            VkExternalMemoryImageCreateInfo extImageInfo = {
-                .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-                .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
-            };
-
-            VkImageDrmFormatModifierExplicitCreateInfoEXT modInfo = {
-                .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
-                .pNext = &extImageInfo,
-                .drmFormatModifier = modifier,
-                // Provide plane offsets and strides collected from drm_desc->layers
-            };
-
-            VkImageCreateInfo imgInfo = {
-                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-                .pNext = &modInfo,
-                .imageType = VK_IMAGE_TYPE_2D,
-                .format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, // Representing NV12 in Vulkan
-                .extent = { (uint32_t) frame->width, (uint32_t) frame->height, 1 },
-                .mipLevels = 1,
-                .arrayLayers = 1,
-                .samples = VK_SAMPLE_COUNT_1_BIT,
-                .tiling = VK_IMAGE_TILING_OPTIMAL,          // or LINEAR if needed
-                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
-            };
-            auto err = vkCreateImage(g_Device, &imgInfo, nullptr, &image);
-            if (err != VK_SUCCESS)
-                return;
-            
-            // Memory requirements
-            VkMemoryRequirements mem_req;
-            vkGetImageMemoryRequirements(g_Device, image, &mem_req);
-
-            // Import the DMA-BUF
-            VkImportMemoryFdInfoKHR import_info = {
-                .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
-                .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-                .fd = dma_fd          // ownership is transferred to Vulkan
-            };
-
-            VkMemoryAllocateInfo alloc_info = {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-                .pNext = &import_info,
-                .allocationSize = mem_req.size,
-                .memoryTypeIndex = /* find a type that supports DEVICE_LOCAL + the external handle */
-            };
-
-            // Find suitable memory type that supports the external handle
-            VkPhysicalDeviceMemoryProperties mem_props;
-            vkGetPhysicalDeviceMemoryProperties(phys_dev, &mem_props);
-            // … (standard loop to pick memoryTypeIndex)
-
-            VkDeviceMemory memory;
-            res = vkAllocateMemory(device, &alloc_info, nullptr, &memory);
-            if (res != VK_SUCCESS) {
-                vkDestroyImage(device, image, nullptr);
-                return res;
-            }
-
-            res = vkBindImageMemory(device, image, memory, 0);
-            if (res != VK_SUCCESS) {
-                vkFreeMemory(device, memory, nullptr);
-                vkDestroyImage(device, image, nullptr);
-                return res;
-            }
-        }
-    }
-
 	void create_texture(AVFrame *frame)
 	{
-		if (frame->format == pix_fmt && frame->width == width && frame->height == height)
-			return;
-
-		destroy_textures();
-		pix_fmt = static_cast<AVPixelFormat>(frame->format);
-		fmt_desc = av_pix_fmt_desc_get(pix_fmt);
-//		SDL_Log("out_pix_fmt: %s\n", av_get_pix_fmt_name(pix_fmt));
-		init_pipeline();
-		width = frame->width;
-		height = frame->height;
+        if (FrameData::init_static(frame)) {
+            for (auto data : frameData) {
+                data.init(frame, g_Device, g_Allocator, g_QueueFamily);
+            }
+        }
 		reset_scale();
-
-		if (n_bindings == 1) {
-			if (fmt_desc->nb_components == 1) {
-				yTexture = create_plane_texture(width, height, SDL_GPU_TEXTUREFORMAT_R8_UNORM);
-				if (fmt_desc->flags & AV_PIX_FMT_FLAG_PAL)
-					uTexture = create_plane_texture(256, 1, SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM);
-			} else if (fmt_desc->nb_components == 2) {
-				yTexture = create_plane_texture(width, height, SDL_GPU_TEXTUREFORMAT_R8G8_UNORM);
-			} else {
-				switch (pix_fmt)
-				{
-				case AV_PIX_FMT_BGR24:
-					setup_sws_context(pix_fmt, AV_PIX_FMT_BGRA);
-				case AV_PIX_FMT_BGRA:
-					yTexture = create_plane_texture(width, height, SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM);
-					break;
-
-				case AV_PIX_FMT_RGB24:
-					setup_sws_context(pix_fmt, AV_PIX_FMT_RGBA);
-				default:
-					yTexture = create_plane_texture(width / de_width, height, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM);
-				}
-			}
-		} else if (n_bindings == 2) {
-			if (bpp > 1) {
-				yTexture = create_plane_texture(width, height, SDL_GPU_TEXTUREFORMAT_R16_UNORM);
-				uTexture = create_plane_texture(width / de_width, height / de_height, SDL_GPU_TEXTUREFORMAT_R16G16_UNORM);
-			} else {
-				yTexture = create_plane_texture(width, height, SDL_GPU_TEXTUREFORMAT_R8_UNORM);
-				uTexture = create_plane_texture(width / de_width, height / de_height, SDL_GPU_TEXTUREFORMAT_R8G8_UNORM);
-			}
-		} else {
-			if (bpp > 1) {
-				yTexture = create_plane_texture(width, height, SDL_GPU_TEXTUREFORMAT_R16_UNORM);
-				uTexture = create_plane_texture(width / de_width, height / de_height, SDL_GPU_TEXTUREFORMAT_R16_UNORM);
-				vTexture = create_plane_texture(width / de_width, height / de_height, SDL_GPU_TEXTUREFORMAT_R16_UNORM);
-				if (n_bindings > 3)
-					aTexture = create_plane_texture(width, height, SDL_GPU_TEXTUREFORMAT_R16_UNORM);
-			} else {
-				yTexture = create_plane_texture(width, height, SDL_GPU_TEXTUREFORMAT_R8_UNORM);
-				uTexture = create_plane_texture(width / de_width, height / de_height, SDL_GPU_TEXTUREFORMAT_R8_UNORM);
-				vTexture = create_plane_texture(width / de_width, height / de_height, SDL_GPU_TEXTUREFORMAT_R8_UNORM);
-				if (n_bindings > 3)
-					aTexture = create_plane_texture(width, height, SDL_GPU_TEXTUREFORMAT_R8_UNORM);
-			}
-		}
 	}
 
-    bool init_pipeline() {
-    }
+public:
+    float video_scale = 1.0;
+    float video_pan_x = 0.0;
+    float video_pan_y = 0.0;
+	auto get_pix_fmt() { return AV_PIX_FMT_NONE; }
 
     bool init(SDL_Window *window) {
         ImVector<const char*> extensions;
@@ -545,23 +428,17 @@ public:
 
         // Create Framebuffers
         SDL_GetWindowSizeInPixels(window, &wnd_w, &wnd_h);
-        ImGui_ImplVulkanH_Window* wd = &g_MainWindowData;
-        SetupVulkanWindow(wd, surface, wnd_w, wnd_h);
-
-        ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
-        wd->ClearValue.color.float32[0] = clear_color.x * clear_color.w;
-        wd->ClearValue.color.float32[1] = clear_color.y * clear_color.w;
-        wd->ClearValue.color.float32[2] = clear_color.z * clear_color.w;
-        wd->ClearValue.color.float32[3] = clear_color.w;
+        SetupVulkanWindow(&vkWindow, surface, wnd_w, wnd_h);
 
         return true;
     }
 
     void shutdown() {
-        ImGui_ImplVulkanH_DestroyWindow(g_Instance, g_Device, &g_MainWindowData, g_Allocator);
-        vkDestroySurfaceKHR(g_Instance, g_MainWindowData.Surface, g_Allocator);
-
-        vkDestroyDescriptorPool(g_Device, g_DescriptorPool, g_Allocator);
+        for (auto data : frameData) {
+            data.destroy(g_Device, g_Allocator);
+        }
+        vkWindow.Destroy(g_Instance, g_Device, g_Allocator);
+        vkDestroySurfaceKHR(g_Instance, vkWindow.Surface, g_Allocator);
 
 #ifdef APP_USE_VULKAN_DEBUG_REPORT
         // Remove the debug report callback
@@ -573,24 +450,8 @@ public:
         vkDestroyInstance(g_Instance, g_Allocator);
     }
 
-    bool imgui_init() {
-        ImGui_ImplVulkan_InitInfo init_info = {};
-        //init_info.ApiVersion = VK_API_VERSION_1_3;              // Pass in your value of VkApplicationInfo::apiVersion, otherwise will default to header version.
-        init_info.Instance = g_Instance;
-        init_info.PhysicalDevice = g_PhysicalDevice;
-        init_info.Device = g_Device;
-        init_info.QueueFamily = g_QueueFamily;
-        init_info.Queue = g_Queue;
-        init_info.PipelineCache = g_PipelineCache;
-        init_info.DescriptorPool = g_DescriptorPool;
-        init_info.MinImageCount = g_MinImageCount;
-        init_info.ImageCount = g_MainWindowData.ImageCount;
-        init_info.Allocator = g_Allocator;
-        init_info.PipelineInfoMain.RenderPass = g_MainWindowData.RenderPass;
-        init_info.PipelineInfoMain.Subpass = 0;
-        init_info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
-        init_info.CheckVkResultFn = check_vk_result;
-        return ImGui_ImplVulkan_Init(&init_info);
+    void set_frame(AVFrame *frame, double play_time, AppSub sub) {
+        frameData[frame_idx].upload(frame, g_Queue, g_Device, g_Allocator);
     }
 
 	void render(AppSub sub)
