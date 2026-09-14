@@ -2,23 +2,22 @@
 
 void check_vk_result(VkResult err);
 
-class FrameData {
-public:
-    VkImage image = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    VkImageView imageView = VK_NULL_HANDLE;
-    VkDescriptorSet set = VK_NULL_HANDLE;
-    VkDescriptorPool pool = VK_NULL_HANDLE;
-    VkSamplerYcbcrConversion ycbcrConversion = VK_NULL_HANDLE;
-    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
-    VkSampler sampler = VK_NULL_HANDLE;
-    VkDeviceMemory upload_buffer_memory = VK_NULL_HANDLE;
-    VkBuffer upload_buffer = VK_NULL_HANDLE;
-    VkFence copyFence = VK_NULL_HANDLE;
-    VkCommandPool commandPool = VK_NULL_HANDLE;
-    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+struct FrameData {
+    vk::raii::Image image = nullptr;
+    vk::raii::DeviceMemory memory = nullptr;
+    vk::raii::ImageView imageView = nullptr;
+    vk::raii::DescriptorSet set = nullptr;
+    vk::raii::DescriptorPool pool = nullptr;
+    vk::raii::SamplerYcbcrConversion ycbcrConversion = nullptr;
+    vk::raii::DescriptorSetLayout layout = nullptr;
+    vk::raii::Sampler sampler = nullptr;
+    vk::raii::DeviceMemory upload_buffer_memory = nullptr;
+    vk::raii::Buffer upload_buffer = nullptr;
+    vk::raii::Fence copyFence = nullptr;
+    vk::raii::CommandPool commandPool = nullptr;
+    vk::raii::CommandBuffer commandBuffer = nullptr;
 
-    VkDeviceSize upload_size;
+    vk::DeviceSize upload_size;
     bool just_created = true;
     AVFrame *frame;
 
@@ -61,199 +60,161 @@ public:
         }
     }
 
-    void init(AVFrame *frame, VkDevice device, VkAllocationCallbacks *allocator, uint32_t queueFamily) {
-        reset(device, allocator);
-
-        if (commandPool == VK_NULL_HANDLE) {
-            // No special flags needed if we reset the entire pool
-            VkCommandPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-            poolInfo.queueFamilyIndex = queueFamily;
-            vkCreateCommandPool(device, &poolInfo, allocator, &commandPool);
-
-            VkCommandBufferAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-            allocInfo.commandPool = commandPool;
-            allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            allocInfo.commandBufferCount = 1;
-            vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
-        }
-
-        VkDescriptorPoolSize pool_sizes[] =
-        {
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 },
-            { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
+    void init(AVFrame *frame, const vk::raii::Device& device, uint32_t queueFamily) {
+        vk::CommandPoolCreateInfo poolInfo = {
+                .queueFamilyIndex = queueFamily
         };
-        VkDescriptorPoolCreateInfo pool_info = {};
-        pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        commandPool = device.createCommandPool(poolInfo);
+
+        vk::CommandBufferAllocateInfo allocInfo = {
+            .commandPool = commandPool,
+            .level = vk::CommandBufferLevel::ePrimary,
+            .commandBufferCount = 1
+        };
+        commandBuffer = std::move(device.allocateCommandBuffers(allocInfo)[0]);
+
+        vk::DescriptorPoolSize pool_sizes[] =
+        {
+            { vk::DescriptorType::eCombinedImageSampler, 1 },
+            { vk::DescriptorType::eUniformBuffer, 1 },
+        };
+        vk::DescriptorPoolCreateInfo pool_info{};
 //        pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
         pool_info.maxSets = 1;
         pool_info.poolSizeCount = (uint32_t)IM_COUNTOF(pool_sizes);
         pool_info.pPoolSizes = pool_sizes;
-        auto err = vkCreateDescriptorPool(device, &pool_info, allocator, &pool);
-        check_vk_result(err);
+        pool = device.createDescriptorPool(pool_info);
 
         //Create the VkSamplerYcbcrConversion
-        VkSamplerYcbcrConversionCreateInfo ycbcrInfo{};
-        ycbcrInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO;
-        ycbcrInfo.format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM; // Match your NV12 layout
-        ycbcrInfo.ycbcrModel = VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_709; // or BT601 depending on video
-        ycbcrInfo.ycbcrRange = VK_SAMPLER_YCBCR_RANGE_ITU_NARROW; // Video levels (16-235) or FULL (0-255)
-        ycbcrInfo.components = { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
-        ycbcrInfo.xChromaOffset = VK_CHROMA_LOCATION_COSITED_EVEN;
-        ycbcrInfo.yChromaOffset = VK_CHROMA_LOCATION_COSITED_EVEN;
-        ycbcrInfo.chromaFilter = VK_FILTER_LINEAR;
-
-        err = vkCreateSamplerYcbcrConversion(device, &ycbcrInfo, nullptr, &ycbcrConversion);
-        check_vk_result(err);
+        vk::SamplerYcbcrConversionCreateInfo ycbcrInfo{};
+        ycbcrInfo.format = vk::Format::eG8B8R82Plane420Unorm; // Match your NV12 layout
+        ycbcrInfo.ycbcrModel = vk::SamplerYcbcrModelConversion::eYcbcr709; // or BT601 depending on video
+        ycbcrInfo.ycbcrRange = vk::SamplerYcbcrRange::eItuNarrow; // Video levels (16-235) or FULL (0-255)
+        ycbcrInfo.components = { vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity };
+        ycbcrInfo.xChromaOffset = vk::ChromaLocation::eCositedEven;
+        ycbcrInfo.yChromaOffset = vk::ChromaLocation::eCositedEven;
+        ycbcrInfo.chromaFilter = vk::Filter::eLinear;
+        ycbcrConversion = device.createSamplerYcbcrConversion(ycbcrInfo);
 
         //Create the Sampler pointing to the Conversion
-        VkSamplerYcbcrConversionInfo samplerConversionInfo{};
-        samplerConversionInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO;
-        samplerConversionInfo.conversion = ycbcrConversion;
-
-        VkSamplerCreateInfo samplerInfo{};
-        samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        vk::SamplerYcbcrConversionInfo samplerConversionInfo = {
+            .conversion = ycbcrConversion
+        };
+        vk::SamplerCreateInfo samplerInfo{};
         samplerInfo.pNext = &samplerConversionInfo; // <-- Bind the conversion rules here
-        samplerInfo.magFilter = VK_FILTER_LINEAR;
-        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        samplerInfo.magFilter = vk::Filter::eLinear;
+        samplerInfo.minFilter = vk::Filter::eLinear;
         // Address modes must be CLAMP_TO_EDGE for YUV samplers
-        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-
-        err = vkCreateSampler(device, &samplerInfo, nullptr, &sampler);
-        check_vk_result(err);
+        samplerInfo.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+        samplerInfo.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+        sampler = device.createSampler(samplerInfo);
 
         // Define the Descriptor Set Layout with an Immutable Sampler
-        VkDescriptorSetLayoutBinding binding{};
+        vk::DescriptorSetLayoutBinding binding{};
         binding.binding = 0;
-        binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        binding.descriptorType = vk::DescriptorType::eCombinedImageSampler;
         binding.descriptorCount = 1;
-        binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-        binding.pImmutableSamplers = &sampler; // <-- Baked directly into the layout binding!
+        binding.stageFlags = vk::ShaderStageFlagBits::eFragment;
+        binding.pImmutableSamplers = &*sampler; // <-- Baked directly into the layout binding!
 
-        VkDescriptorSetLayoutCreateInfo layoutInfo{};
-        layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        vk::DescriptorSetLayoutCreateInfo layoutInfo{};
         layoutInfo.bindingCount = 1;
         layoutInfo.pBindings = &binding;
-
-        err = vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &layout);
+        layout = device.createDescriptorSetLayout(layoutInfo);
 
         // Allocate a descriptor set from the pool
-        VkDescriptorSetAllocateInfo allocInfo{};
-        allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        allocInfo.descriptorPool = pool; // The pool we just created
-        allocInfo.descriptorSetCount = 1;
-        allocInfo.pSetLayouts = &layout; // Your predefined VkDescriptorSetLayout
-
-        err = vkAllocateDescriptorSets(device, &allocInfo, &set);
-        check_vk_result(err);
+        vk::DescriptorSetAllocateInfo alloc_info{};
+        alloc_info.descriptorPool = pool; // The pool we just created
+        alloc_info.descriptorSetCount = 1;
+        alloc_info.pSetLayouts = &*layout; // Your predefined VkDescriptorSetLayout
+        set = std::move(device.allocateDescriptorSets(alloc_info)[0]);
 
         // Create the Image
-        VkFormat format;
+        vk::Format format;
         switch (frame->format) {
             case AV_PIX_FMT_NV12:
-                format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+                format = vk::Format::eG8B8R82Plane420Unorm;
                 break;
             default:
                 return;
         }
 
-        VkImageCreateInfo info = {};
-        info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        info.imageType = VK_IMAGE_TYPE_2D;
+        vk::ImageCreateInfo info = {};
+        info.imageType = vk::ImageType::e2D;
         info.format = format;
         info.extent.width = frame->width;
         info.extent.height = frame->height;
         info.extent.depth = 1;
         info.mipLevels = 1;
         info.arrayLayers = 1;
-        info.samples = VK_SAMPLE_COUNT_1_BIT;
-        info.tiling = VK_IMAGE_TILING_OPTIMAL;
-        info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        err = vkCreateImage(device, &info, allocator, &image);
-        check_vk_result(err);
-        VkMemoryRequirements req;
-        vkGetImageMemoryRequirements(device, image, &req);
-        VkMemoryAllocateInfo alloc_info = {};
-        alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        alloc_info.allocationSize = req.size;
-        alloc_info.memoryTypeIndex = req.memoryTypeBits;
-        err = vkAllocateMemory(device, &alloc_info, allocator, &memory);
-        check_vk_result(err);
-        err = vkBindImageMemory(device, image, memory, 0);
-        check_vk_result(err);
+        info.samples = vk::SampleCountFlagBits::e1;
+        info.tiling = vk::ImageTiling::eOptimal;
+        info.usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst;
+        info.sharingMode = vk::SharingMode::eExclusive;
+        info.initialLayout = vk::ImageLayout::eUndefined;
+        image = device.createImage(info);
+        auto req = image.getMemoryRequirements();
+        vk::MemoryAllocateInfo mem_alloc_info = {};
+        mem_alloc_info.allocationSize = req.size;
+        mem_alloc_info.memoryTypeIndex = req.memoryTypeBits;
+        memory = device.allocateMemory(mem_alloc_info);
+        image.bindMemory(memory, 0);
 
         // Create the VkImageView with Conversion Info
-        VkSamplerYcbcrConversionInfo viewConversionInfo{};
-        viewConversionInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO;
+        vk::SamplerYcbcrConversionInfo viewConversionInfo{};
         viewConversionInfo.conversion = ycbcrConversion;
 
-        VkImageViewCreateInfo viewInfo{};
-        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        vk::ImageViewCreateInfo viewInfo{};
         viewInfo.pNext = &viewConversionInfo; // <-- Crucial!
         viewInfo.image = image;     // The VkImage containing your uploaded AVFrame data
-        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.viewType = vk::ImageViewType::e2D;
         viewInfo.format = format;
-        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; // Vulkan handles sub-planes internally
+        viewInfo.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor; // Vulkan handles sub-planes internally
         viewInfo.subresourceRange.levelCount = 1;
         viewInfo.subresourceRange.layerCount = 1;
-
-        vkCreateImageView(device, &viewInfo, nullptr, &imageView);
+        imageView = device.createImageView(viewInfo);
 
         //Update the Descriptor Set
-        VkDescriptorImageInfo imageInfo{};
+        vk::DescriptorImageInfo imageInfo{};
         imageInfo.imageView = imageView;
-        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        imageInfo.sampler = VK_NULL_HANDLE; // Ignored because we used an immutable sampler!
+        imageInfo.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+//        imageInfo.sampler = VK_NULL_HANDLE; // Ignored because we used an immutable sampler!
 
-        VkWriteDescriptorSet descriptorWrite{};
-        descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        vk::WriteDescriptorSet descriptorWrite{};
         descriptorWrite.dstSet = set;
         descriptorWrite.dstBinding = 0;
-        descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        descriptorWrite.descriptorType = vk::DescriptorType::eCombinedImageSampler;
         descriptorWrite.descriptorCount = 1;
         descriptorWrite.pImageInfo = &imageInfo;
-
-        vkUpdateDescriptorSets(device, 1, &descriptorWrite, 0, nullptr);
+        device.updateDescriptorSets(descriptorWrite, nullptr);
 
         // Create the Upload Buffer:
         upload_size = get_upload_size();
         {
-            VkBufferCreateInfo buffer_info = {};
-            buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            vk::BufferCreateInfo buffer_info = {};
             buffer_info.size = upload_size;
-            buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-            buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-            err = vkCreateBuffer(device, &buffer_info, allocator, &upload_buffer);
-            check_vk_result(err);
-            VkMemoryRequirements req;
-            vkGetBufferMemoryRequirements(device, upload_buffer, &req);
-            VkMemoryAllocateInfo alloc_info = {};
-            alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            buffer_info.usage = vk::BufferUsageFlagBits::eTransferSrc;
+            buffer_info.sharingMode = vk::SharingMode::eExclusive;
+            upload_buffer = device.createBuffer(buffer_info);
+            auto req = upload_buffer.getMemoryRequirements();
+            vk::MemoryAllocateInfo alloc_info = {};
             alloc_info.allocationSize = req.size;
-            alloc_info.memoryTypeIndex = req.memoryTypeBits | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-            err = vkAllocateMemory(device, &alloc_info, allocator, &upload_buffer_memory);
-            check_vk_result(err);
-            err = vkBindBufferMemory(device, upload_buffer, upload_buffer_memory, 0);
-            check_vk_result(err);
+            alloc_info.memoryTypeIndex = req.memoryTypeBits;// | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+            upload_buffer_memory = device.allocateMemory(alloc_info);
+            upload_buffer.bindMemory(upload_buffer_memory, 0);
         }
 
         just_created = true;
     }
 
-    void upload(AVFrame *frame, VkQueue queue, VkDevice device, VkAllocationCallbacks *allocator) {
+    void upload(AVFrame *frame, const vk::raii::Queue& queue, const vk::raii::Device& device) {
 		if (this->frame)
 			ff::frame_recycle(this->frame);
 		this->frame = frame;
 
-        VkResult err;
-
         int offset[4]{};
         // Upload to Buffer:
-        char* map = nullptr;
-        err = vkMapMemory(device, upload_buffer_memory, 0, upload_size, 0, (void**)(&map));
-        check_vk_result(err);
+        uint8_t *map = (uint8_t *) upload_buffer_memory.mapMemory(0, upload_size);
         uint8_t *src = frame->data[0];
         auto map_save = map;
         auto bytes_per_line = width * bpp;
@@ -287,133 +248,84 @@ public:
         range[0].size = upload_size;
         err = vkFlushMappedMemoryRanges(v->Device, 1, range);
         check_vk_result(err);*/
-        vkUnmapMemory(device, upload_buffer_memory);
+        upload_buffer_memory.unmapMemory();
 
         // Start command buffer
         {
-            err = vkResetCommandPool(device, commandPool, 0);
-            check_vk_result(err);
-            VkCommandBufferBeginInfo begin_info = {};
-            begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            begin_info.flags |= VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            err = vkBeginCommandBuffer(commandBuffer, &begin_info);
-            check_vk_result(err);
+            commandPool.reset();
+            vk::CommandBufferBeginInfo begin_info = {};
+            begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+            commandBuffer.begin(begin_info);
         }
 
         // Copy to Image:
         {
-            VkBufferMemoryBarrier upload_barrier[1] = {};
-            upload_barrier[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-            upload_barrier[0].srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-            upload_barrier[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            upload_barrier[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            upload_barrier[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            upload_barrier[0].buffer = upload_buffer;
-            upload_barrier[0].offset = 0;
-            upload_barrier[0].size = upload_size;
+            vk::BufferMemoryBarrier bufferBarrier = {
+                .srcAccessMask = vk::AccessFlagBits::eHostWrite,
+                .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+                .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
+                .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
+                .buffer = *upload_buffer,
+                .size = upload_size,
+            };
+            vk::ImageMemoryBarrier imageBarrier = {
+                .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::ePresentSrcKHR,
+                .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
+                .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
+                .subresourceRange = {
+                    .aspectMask = vk::ImageAspectFlags::BitsType::eColor,
+                    .levelCount = 1,
+                    .layerCount = 1,
+                },
+            };
+            commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eFragmentShader | vk::PipelineStageFlagBits::eHost, vk::PipelineStageFlagBits::eTransfer, {}, nullptr, bufferBarrier, imageBarrier);
 
-            VkImageMemoryBarrier copy_barrier[1] = {};
-            copy_barrier[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            copy_barrier[0].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            copy_barrier[0].oldLayout = just_created ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            copy_barrier[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            copy_barrier[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            copy_barrier[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            copy_barrier[0].image = image;
-            copy_barrier[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            copy_barrier[0].subresourceRange.levelCount = 1;
-            copy_barrier[0].subresourceRange.layerCount = 1;
-            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, upload_barrier, 1, copy_barrier);
-
-            VkBufferImageCopy region = {};
-            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            vk::BufferImageCopy2 region = {};
+            region.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
             region.imageSubresource.layerCount = 1;
             region.imageExtent.width = width;
             region.imageExtent.height = height;
             region.imageExtent.depth = 1;
             region.imageOffset.x = 0;
             region.imageOffset.y = 0;
-            vkCmdCopyBufferToImage(commandBuffer, upload_buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            vk::CopyBufferToImageInfo2 copy_info = {
+                .srcBuffer = upload_buffer,
+                .dstImage = image,
+                .dstImageLayout = vk::ImageLayout::eTransferDstOptimal,
+                .regionCount = 1,
+                .pRegions = &region,
+            };
+            commandBuffer.copyBufferToImage2(copy_info);
 
-            VkImageMemoryBarrier use_barrier[1] = {};
-            use_barrier[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            use_barrier[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            use_barrier[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            use_barrier[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            use_barrier[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            use_barrier[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            use_barrier[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            use_barrier[0].image = image;
-            use_barrier[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            use_barrier[0].subresourceRange.levelCount = 1;
-            use_barrier[0].subresourceRange.layerCount = 1;
-            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, use_barrier);
+            imageBarrier = {
+                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+                .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
+                .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
+                .image = *image,
+                .subresourceRange = {
+                    .aspectMask = vk::ImageAspectFlags::BitsType::eColor,
+                    .levelCount = 1,
+                    .layerCount = 1,
+                },
+            };
+            commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eFragmentShader, {}, nullptr, nullptr, imageBarrier);
         }
 
         // End command buffer
         {
-            VkSubmitInfo end_info = {};
-            end_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            commandBuffer.end();
+            vk::SubmitInfo end_info = {};
             end_info.commandBufferCount = 1;
-            end_info.pCommandBuffers = &commandBuffer;
-            auto err = vkEndCommandBuffer(commandBuffer);
-            check_vk_result(err);
-            err = vkQueueSubmit(queue, 1, &end_info, VK_NULL_HANDLE);
-            check_vk_result(err);
+            end_info.pCommandBuffers = &*commandBuffer;
+            queue.submit(end_info);
         }
-
-        err = vkQueueWaitIdle(queue); // FIXME-OPT: Suboptimal!
-        check_vk_result(err);
 
         just_created = false;
-    }
-
-    void reset(VkDevice device, VkAllocationCallbacks *allocator) {
-        if (pool) {
-            vkDestroyDescriptorPool(device, pool, allocator);
-            set = VK_NULL_HANDLE;
-            pool = VK_NULL_HANDLE;
-        }
-        if (imageView) {
-            vkDestroyImageView(device, imageView, allocator);
-            imageView = VK_NULL_HANDLE;
-        }
-        if (image) {
-            vkDestroyImage(device, image, allocator);
-            image = VK_NULL_HANDLE;
-        }
-        if (memory) {
-            vkFreeMemory(device, memory, allocator);
-            memory = VK_NULL_HANDLE;
-        }
-        if (upload_buffer_memory) {
-            vkFreeMemory(device, upload_buffer_memory, allocator);
-            memory = VK_NULL_HANDLE;
-        }
-        if (upload_buffer) {
-            vkDestroyBuffer(device, upload_buffer, allocator);
-            upload_buffer = VK_NULL_HANDLE;
-        }
-        if (sampler) {
-            vkDestroySampler(device, sampler, allocator);
-            sampler = VK_NULL_HANDLE;
-        }
-        if (layout) {
-            vkDestroyDescriptorSetLayout(device, layout, allocator);
-            layout = VK_NULL_HANDLE;
-        }
-        if (ycbcrConversion) {
-            vkDestroySamplerYcbcrConversion(device, ycbcrConversion, allocator);
-            ycbcrConversion = VK_NULL_HANDLE;
-        }
-    }
-
-    void destroy(VkDevice device, VkAllocationCallbacks *allocator) {
-        reset(device, allocator);
-        if (commandPool) {
-            vkDestroyCommandPool(device, commandPool, allocator);
-            commandPool = VK_NULL_HANDLE;
-            commandBuffer = VK_NULL_HANDLE;
-        }
+        queue.waitIdle();
     }
 };
