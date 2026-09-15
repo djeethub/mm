@@ -3,11 +3,6 @@
 #include <string>
 #include <format>
 
-#include <SDL3/SDL.h>
-#include <imgui.h>
-#include <imgui_impl_sdl3.h>
-#include <imgui_impl_vulkan.h>
-
 //#include <fontconfig/fontconfig.h>
 
 #include "appstate.hpp"
@@ -90,7 +85,7 @@ class AppGui {
 
             // Setup Platform/Renderer backends
             ImGui_ImplSDL3_InitForVulkan(state->window);
-            state->gpu.imgui_init();
+            state->gpu.imgui_init(2);
 
             // 3. Load the fonts from your local system or project directory
             // Arguments: (Filepath, Font Size in pixels, Config Struct, Glyph Ranges)

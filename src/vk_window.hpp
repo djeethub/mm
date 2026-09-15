@@ -1,6 +1,6 @@
 #pragma once
 
-void check_vk_result(VkResult err);
+#include "vk_frame.hpp"
 
 struct Swap
 {
@@ -76,25 +76,24 @@ class VkWindow {
 public:
     // Input
     bool                    UseDynamicRendering = false;
-    vk::raii::SurfaceKHR      Surface = nullptr;            // Surface created and destroyed by caller.
+    vk::SurfaceKHR          Surface;            // Surface created and destroyed by caller.
     vk::SurfaceFormatKHR      SurfaceFormat{};
     vk::PresentModeKHR        PresentMode{};
     vk::AttachmentDescription AttachmentDesc{};     // RenderPass creation: main attachment description.
     vk::ClearValue            ClearValue{};         // RenderPass creation: clear value when using VK_ATTACHMENT_LOAD_OP_CLEAR.
 
     // Internal
-    int                     Width{};              // Generally same as passed to ImGui_ImplVulkanH_CreateOrResizeWindow()
-    int                     Height{};
+    int                     Width;              // Generally same as passed to ImGui_ImplVulkanH_CreateOrResizeWindow()
+    int                     Height;
     vk::raii::SwapchainKHR  Swapchain = nullptr;
     vk::raii::RenderPass    RenderPass  = nullptr;
-    vk::raii::Pipeline      Pipeline = nullptr;           // The window pipeline may uses a different VkRenderPass than the one passed in ImGui_ImplVulkan_InitInfo
-    uint32_t                FrameIndex{};         // Current frame being rendered to (0 <= FrameIndex < FrameInFlightCount)
-    uint32_t                ImageCount{};         // Number of simultaneous in-flight frames (returned by vkGetSwapchainImagesKHR, usually derived from min_image_count)
-    uint32_t                SemaphoreCount{};     // Number of simultaneous in-flight frames + 1, to be able to use it in vkAcquireNextImageKHR
-    uint32_t                SemaphoreIndex{};     // Current set of swapchain wait semaphores we're using (needs to be distinct from per frame data)
+    uint32_t                FrameIndex;         // Current frame being rendered to (0 <= FrameIndex < FrameInFlightCount)
+    uint32_t                ImageCount;         // Number of simultaneous in-flight frames (returned by vkGetSwapchainImagesKHR, usually derived from min_image_count)
+    uint32_t                SemaphoreCount;     // Number of simultaneous in-flight frames + 1, to be able to use it in vkAcquireNextImageKHR
+    uint32_t                SemaphoreIndex;     // Current set of swapchain wait semaphores we're using (needs to be distinct from per frame data)
     std::vector<Swap> Frames;
     std::vector<SwapSemaphores> FrameSemaphores;
-    bool need_rebuild = true;
+    bool need_rebuild;
 
     int GetMinImageCountFromPresentMode(vk::PresentModeKHR present_mode)
     {
@@ -104,8 +103,7 @@ public:
             return 2;
         if (present_mode == vk::PresentModeKHR::eImmediate)
             return 1;
-        std::unreachable;
-        return 1;
+        std::unreachable();
     }
 
     // Also destroy old swap chain and in-flight frames data, if any.
@@ -254,33 +252,24 @@ public:
                 fd->Framebuffer = device.createFramebuffer(info);
             }
         }
+
+        need_rebuild = false;
     }
 
-    // - 2025/09/26: v1.92.4 added a trailing 'VkImageUsageFlags image_usage' parameter which is usually VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT.
-    void CreateOrResizeWindow(const vk::raii::Instance& instance, const vk::raii::PhysicalDevice& physical_device, const vk::raii::Device& device, uint32_t queue_family, int width, int height, uint32_t min_image_count)
-    {
-//        IM_ASSERT(g_FunctionsLoaded && "Need to call ImGui_ImplVulkan_LoadFunctions() if IMGUI_IMPL_VULKAN_NO_PROTOTYPES or VK_NO_PROTOTYPES are set!");
-        IM_ASSERT(Surface != VK_NULL_HANDLE);
-        IM_UNUSED(instance);
-
-        CreateWindowSwapChain(physical_device, device, width, height, min_image_count, queue_family);
-    }
-
-    bool render(const vk::raii::Device& device, const vk::raii::Queue& queue, ImDrawData* draw_data)
+    bool render(const vk::raii::Device& device, const vk::raii::Queue& queue, FrameData *frame_data, ImDrawData* draw_data)
     {
         vk::Semaphore image_acquired_semaphore = FrameSemaphores[SemaphoreIndex].ImageAcquiredSemaphore;
         vk::Semaphore render_complete_semaphore = FrameSemaphores[SemaphoreIndex].RenderCompleteSemaphore;
-        auto acquire_err = Swapchain.acquireNextImage(UINT64_MAX, image_acquired_semaphore);
-        if (acquire_err.result != vk::Result::eSuccess) {
-            if (acquire_err.result == vk::Result::eErrorOutOfDateKHR || acquire_err.result == vk::Result::eSuboptimalKHR) {
+        auto [err, FrameIndex] = Swapchain.acquireNextImage(UINT64_MAX, image_acquired_semaphore);
+        if (err != vk::Result::eSuccess) {
+            if (err == vk::Result::eErrorOutOfDateKHR || err == vk::Result::eSuboptimalKHR) {
                 need_rebuild = true;
             }
             return false;
         }
-        FrameIndex = acquire_err.value;
 
         auto* fd = &Frames[FrameIndex];
-        auto err = device.waitForFences(*fd->Fence, vk::True, UINT64_MAX);
+        err = device.waitForFences(*fd->Fence, vk::True, UINT64_MAX);
         if (err != vk::Result::eSuccess)
             return false;
         device.resetFences(*fd->Fence);

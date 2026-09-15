@@ -676,9 +676,7 @@ public:
             auto play_time = get_play_time();
             auto video_frame = check_video_frame(play_time);
             if (video_frame) {
-                ff::frame_recycle(video_frame);
-                video_frame = nullptr;
-//                gpu.set_frame(video_frame, play_time, app_sub);
+                gpu.set_frame(video_frame, play_time, app_sub);
             } else if (video.is_eof.load(std::memory_order_relaxed)) {
                 auto duration = video.get_duration();
                 if (duration <= play_time) {
@@ -687,6 +685,7 @@ public:
                         set_video_play(false);
                 }
             }
+            gpu.check_next_frame(play_time);
         }
 
         gpu.render(app_sub);

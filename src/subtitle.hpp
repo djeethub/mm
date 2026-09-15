@@ -1,7 +1,5 @@
 #pragma once
 
-#include <SDL3/SDL.h>
-
 template <typename T>
 class GPUPool {
 protected:

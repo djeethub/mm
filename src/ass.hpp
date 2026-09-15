@@ -1,7 +1,6 @@
 #pragma once
 
 #include <ass/ass.h>
-#include <SDL3/SDL.h>
 
 #include "ffmpeg.hpp"
 #include "subtitle.hpp"
