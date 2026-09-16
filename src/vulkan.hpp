@@ -22,43 +22,6 @@ constexpr bool enableValidationLayers = true;
 const std::vector<char const *> validationLayers = {
     "VK_LAYER_KHRONOS_validation"};
 
-struct XferData {
-	SDL_GPUTransferBuffer *buf;
-	Uint32 size;
-
-	void destroy(SDL_GPUDevice *device) {
-		if (buf)
-			SDL_ReleaseGPUTransferBuffer(device, buf);
-		delete this;
-	}
-
-	void reset() {}
-};
-
-class XferPool : public GPUPool<XferData> {
-public:
-	XferData *alloc(Uint32 size) {
-		if (!list.empty()) {
-			auto data = list.back();
-			list.pop_back();
-			if (data->size >= size) {
-				return data;
-			}
-			data->destroy(device);
-		}
-
-		SDL_GPUTransferBufferCreateInfo tb_info = {
-			.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
-			.size = size,
-		};
-		SDL_GPUTransferBuffer *buf = SDL_CreateGPUTransferBuffer(device, &tb_info);
-		if (!buf)
-			return nullptr;
-		auto data = new XferData{.buf = buf, .size = size};
-		return data;
-	}
-};
-
 void check_vk_result(VkResult err)
 {
     if (err == VK_SUCCESS)
@@ -78,7 +41,12 @@ class AppVk {
 private:
     const int      MAX_FRAMES_IN_FLIGHT = 2;
 	std::vector<const char *> requiredDeviceExtension = {
-	    vk::KHRSwapchainExtensionName};
+	    vk::KHRSwapchainExtensionName,
+		vk::EXTExternalMemoryDmaBufExtensionName,
+		vk::EXTImageDrmFormatModifierExtensionName,
+//		vk::KHRExternalMemoryExtensionName,
+//		vk::KHRExternalMemoryFdExtensionName
+	};
 
     vk::raii::Context context;
     vk::raii::Instance instance = nullptr;
@@ -95,7 +63,6 @@ private:
 	vk::SurfaceFormatKHR             swapChainSurfaceFormat;
 	vk::Extent2D                     swapChainExtent;
 	std::vector<vk::raii::ImageView> swapChainImageViews;
-
 	vk::raii::CommandPool                commandPool = nullptr;
 	std::vector<vk::raii::CommandBuffer> commandBuffers;
 
@@ -104,14 +71,12 @@ private:
     std::vector<vk::raii::Fence>     inFlightFences;
     uint32_t                         frameIndex = 0;
 
-    bool framebufferResized = false;
-
     VkVideo video;
 
+    bool framebufferResized = false;
 	int wnd_w = 0;
 	int wnd_h = 0;
 	float base_scale = 0.0;
-//	XferPool xfer_pool;
 	SwsContext *sws_ctx = nullptr;
 
 	std::vector<const char *> getRequiredInstanceExtensions()
@@ -124,6 +89,8 @@ private:
 		{
 			extensions.push_back(vk::EXTDebugUtilsExtensionName);
 		}
+//		extensions.push_back(vk::KHRExternalMemoryCapabilitiesExtensionName);
+//		extensions.push_back(vk::KHRGetPhysicalDeviceProperties2ExtensionName);
 
 		return extensions;
 	}
@@ -517,15 +484,6 @@ private:
         return false;
     }
 
-	void create_texture(AVFrame *frame)
-	{
-        if (video.check_frame(frame))
-            return;
-
-        video.init(frame, device, queueIndex, swapChainSurfaceFormat.format);
-		reset_scale();
-	}
-
 	void transition_image_layout(
 	    uint32_t                imageIndex,
 	    vk::ImageLayout         old_layout,
@@ -579,9 +537,14 @@ public:
 #endif // APP_USE_VULKAN_DEBUG_REPORT
     }
 
-    void set_frame(AVFrame *frame, double play_time, AppSub sub) {
-        create_texture(frame);
-        video.upload(frame, device, queue, play_time);
+    void set_frame(AvFrameData frame_data, AppSub sub) {
+        if (!video.check_frame(frame_data.frame))
+		{
+			device.waitIdle();
+		    video.init(frame_data.frame, device, queueIndex, swapChainSurfaceFormat.format);
+			reset_scale();
+		}
+        video.upload(std::move(frame_data), device, queue);
     }
 
     bool check_next_frame(double play_time) {
@@ -589,8 +552,8 @@ public:
     }
 
 	void render_frame(const vk::CommandBuffer& commandBuffer) {
-        auto& fd = video.get_current_frame();
-        if (fd.status != VkFrame::Ready)
+        auto& vf = video.get_current_frame();
+        if (vf.status != VkFrame::Ready)
             return;
 
         commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *video.pipeline);
@@ -598,16 +561,16 @@ public:
 		commandBuffer.setScissor(0, vk::Rect2D(vk::Offset2D(0, 0), swapChainExtent));
 //		commandBuffer.bindVertexBuffers(0, *vertexBuffer, {0});
 //		commandBuffer.bindIndexBuffer(*indexBuffer, 0, vk::IndexTypeValue<decltype(indices)::value_type>::value);
-		commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, video.pipelineLayout, 0, *fd.set, nullptr);
+		commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, video.pipelineLayout, 0, *vf.set, nullptr);
         auto scale = base_scale * video_scale;
-		float w = 2.0f * scale * fd.frame->width / wnd_w;
-		float h = 2.0f * scale * fd.frame->height / wnd_h;
+		float w = 2.0f * scale * vf.frame_data.frame->width / wnd_w;
+		float h = 2.0f * scale * vf.frame_data.frame->height / wnd_h;
 		Vertform tf = {
 			.position = { video_pan_x / wnd_w, video_pan_y / wnd_h },
 			.size = { w, h }
 		};
         Uniforms uf = {
-            .tex_size = {(float)fd.frame->width, (float)fd.frame->height},
+            .tex_size = {(float)vf.frame_data.frame->width, (float)vf.frame_data.frame->height},
 //            .color_range = fd.frame->color_range == AVCOL_RANGE_UNSPECIFIED ? AVCOL_RANGE_MPEG : fd.frame->color_range,
 //            .colorspace = fd.frame->colorspace == AVCOL_SPC_UNSPECIFIED ? AVCOL_SPC_BT709 : fd.frame->colorspace
         };

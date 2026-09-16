@@ -1,5 +1,7 @@
 #pragma once
 
+#include <unistd.h>
+
 #include "ffmpeg.hpp"
 
 #include "vert.vert.h"
@@ -37,6 +39,43 @@ struct Uniforms
 	float tex_size[2]; // width, height of Y plane
 };
 
+struct AvFrameData {
+    AVFrame *frame = nullptr;
+    AVFrame *mapped = nullptr;
+    double play_time;
+
+    // 1. Non-copyable (or implement deep copy if you really need it)
+    AvFrameData() {}
+    AvFrameData(const AvFrameData&)            = delete;
+    AvFrameData& operator=(const AvFrameData&) = delete;
+
+    // 2. Move constructor / move assignment that *transfer* ownership
+    AvFrameData(AvFrameData&& other) noexcept
+        : frame(std::exchange(other.frame, nullptr)),
+          mapped(std::exchange(other.mapped, nullptr)),
+          play_time(other.play_time)
+    {}
+
+    AvFrameData& operator=(AvFrameData&& other) noexcept {
+        if (this != &other) {
+            // release what we currently own
+            ff::frame_recycle(mapped);
+            ff::frame_recycle(frame);
+
+            // steal
+            frame     = std::exchange(other.frame, nullptr);
+            mapped    = std::exchange(other.mapped, nullptr);
+            play_time = other.play_time;
+        }
+        return *this;
+    }
+
+    ~AvFrameData() {
+        ff::frame_recycle(mapped);
+        ff::frame_recycle(frame);
+    }
+};
+
 struct VkFrame {
     enum Status {
         None,
@@ -57,14 +96,13 @@ struct VkFrame {
     vk::raii::CommandPool commandPool = nullptr;
     vk::raii::CommandBuffer commandBuffer = nullptr;
 
+    AvFrameData frame_data;
     Status status = None;
-    AVFrame *frame = nullptr;
-    double play_time;
 };
 
 class VkVideo {
 private:
-    inline static const int N_FRAMES = 2;
+    inline static const int N_FRAMES = 4;
 
     vk::raii::SamplerYcbcrConversion ycbcrConversion = nullptr;
     vk::raii::DescriptorSetLayout layout = nullptr;
@@ -81,13 +119,8 @@ private:
     int bpp;
     vk::Format format;
 
-    void init_frames(AVFrame *frame, const vk::raii::Device& device, uint32_t queueFamily) {
+    void init_frames(const AVFrame *frame, const vk::raii::Device& device, uint32_t queueFamily) {
         for (auto& x : frames) {
-            if (x.frame) {
-                ff::frame_recycle(x.frame);
-                x.frame = nullptr;
-            }
-
             if (!*x.commandPool) {
                 vk::CommandPoolCreateInfo poolInfo = {
                     .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
@@ -127,78 +160,83 @@ private:
                 };
                 x.set = std::move(device.allocateDescriptorSets(alloc_info)[0]);
             } else {
-                device.resetFences(*x.copyFence);
+                vk::FenceCreateInfo fence_info = {
+                    .flags = vk::FenceCreateFlagBits::eSignaled,
+                };
+                x.copyFence = device.createFence(fence_info);
             }
 
             // Create the Image
-            vk::ImageCreateInfo info = {};
-            info.imageType = vk::ImageType::e2D;
-            info.format = format;
-            info.extent.width = frame->width;
-            info.extent.height = frame->height;
-            info.extent.depth = 1;
-            info.mipLevels = 1;
-            info.arrayLayers = 1;
-            info.samples = vk::SampleCountFlagBits::e1;
-            info.tiling = vk::ImageTiling::eOptimal;
-            info.usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst;
-            info.sharingMode = vk::SharingMode::eExclusive;
-            info.initialLayout = vk::ImageLayout::eUndefined;
-            x.image = device.createImage(info);
-            auto req = x.image.getMemoryRequirements();
-            vk::MemoryAllocateInfo mem_alloc_info = {};
-            mem_alloc_info.allocationSize = req.size;
-            mem_alloc_info.memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal);
-            x.memory = device.allocateMemory(mem_alloc_info);
-            x.image.bindMemory(x.memory, 0);
-
-            // Create the VkImageView with Conversion Info
-            vk::SamplerYcbcrConversionInfo viewConversionInfo = {
-                .conversion = ycbcrConversion
-            };
-            vk::ImageViewCreateInfo viewInfo{};
-            viewInfo.pNext = &viewConversionInfo; // <-- Crucial!
-            viewInfo.image = x.image;     // The VkImage containing your uploaded AVFrame data
-            viewInfo.viewType = vk::ImageViewType::e2D;
-            viewInfo.format = format;
-            viewInfo.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor; // Vulkan handles sub-planes internally
-            viewInfo.subresourceRange.levelCount = 1;
-            viewInfo.subresourceRange.layerCount = 1;
-            x.imageView = device.createImageView(viewInfo);
-
-            // Create the Upload Buffer:
-            upload_size = get_upload_size();
-            {
-                vk::BufferCreateInfo buffer_info = {
-                    .size = upload_size,
-                    .usage = vk::BufferUsageFlagBits::eTransferSrc,
-                    .sharingMode = vk::SharingMode::eExclusive
+            if (frame->hw_frames_ctx) {
+            } else {
+                vk::ImageCreateInfo info = {
+                    .imageType = vk::ImageType::e2D,
+                    .format = format,
+                    .extent = { .width = (uint32_t) frame->width, .height = (uint32_t) frame->height, .depth = 1 },
+                    .mipLevels = 1,
+                    .arrayLayers = 1,
+                    .samples = vk::SampleCountFlagBits::e1,
+                    .tiling = vk::ImageTiling::eOptimal,
+                    .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
+                    .sharingMode = vk::SharingMode::eExclusive,
+                    .initialLayout = vk::ImageLayout::eUndefined,
                 };
-                x.upload_buffer = device.createBuffer(buffer_info);
-                auto req = x.upload_buffer.getMemoryRequirements();
-                vk::MemoryAllocateInfo alloc_info = {
-                    .allocationSize = req.size,
-                    .memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)
-                };
-                x.upload_buffer_memory = device.allocateMemory(alloc_info);
-                x.upload_buffer.bindMemory(x.upload_buffer_memory, 0);
-            }
+                x.image = device.createImage(info);
+                auto req = x.image.getMemoryRequirements();
+                vk::MemoryAllocateInfo mem_alloc_info = {};
+                mem_alloc_info.allocationSize = req.size;
+                mem_alloc_info.memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal);
+                x.memory = device.allocateMemory(mem_alloc_info);
+                x.image.bindMemory(x.memory, 0);
 
-            //Update the Descriptor Set
-            vk::DescriptorImageInfo imageInfo{
-                .imageView = x.imageView,
-                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
-            };
-            vk::WriteDescriptorSet descriptorWrites[] = {
+                // Create the Upload Buffer:
+                upload_size = get_upload_size();
                 {
-                    .dstSet = x.set,
-                    .dstBinding = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-                    .pImageInfo = &imageInfo,
-                },
-            };
-            device.updateDescriptorSets(descriptorWrites, nullptr);
+                    vk::BufferCreateInfo buffer_info = {
+                        .size = upload_size,
+                        .usage = vk::BufferUsageFlagBits::eTransferSrc,
+                        .sharingMode = vk::SharingMode::eExclusive
+                    };
+                    x.upload_buffer = device.createBuffer(buffer_info);
+                    auto req = x.upload_buffer.getMemoryRequirements();
+                    vk::MemoryAllocateInfo alloc_info = {
+                        .allocationSize = req.size,
+                        .memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)
+                    };
+                    x.upload_buffer_memory = device.allocateMemory(alloc_info);
+                    x.upload_buffer.bindMemory(x.upload_buffer_memory, 0);
+                }
+
+                // Create the VkImageView with Conversion Info
+                vk::SamplerYcbcrConversionInfo viewConversionInfo = {
+                    .conversion = ycbcrConversion
+                };
+                vk::ImageViewCreateInfo viewInfo{};
+                viewInfo.pNext = &viewConversionInfo; // <-- Crucial!
+                viewInfo.image = x.image;     // The VkImage containing your uploaded AVFrame data
+                viewInfo.viewType = vk::ImageViewType::e2D;
+                viewInfo.format = format;
+                viewInfo.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor; // Vulkan handles sub-planes internally
+                viewInfo.subresourceRange.levelCount = 1;
+                viewInfo.subresourceRange.layerCount = 1;
+                x.imageView = device.createImageView(viewInfo);
+
+                //Update the Descriptor Set
+                vk::DescriptorImageInfo imageInfo{
+                    .imageView = x.imageView,
+                    .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+                };
+                vk::WriteDescriptorSet descriptorWrites[] = {
+                    {
+                        .dstSet = x.set,
+                        .dstBinding = 0,
+                        .descriptorCount = 1,
+                        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                        .pImageInfo = &imageInfo,
+                    },
+                };
+                device.updateDescriptorSets(descriptorWrites, nullptr);
+            }
 
             x.status = VkFrame::New;
         }
@@ -246,14 +284,27 @@ public:
     vk::raii::Pipeline pipeline = nullptr;
     vk::PhysicalDeviceMemoryProperties memProperties;
 
-    bool check_frame(AVFrame *frame) {
-        if (frame->format == pix_fmt && width == frame->width && height == frame->height)
+    bool check_frame(const AVFrame *frame) {
+        AVPixelFormat format;
+        if (frame->hw_frames_ctx) {
+            // Access the frame context structural layer
+            AVHWFramesContext *hwfc = (AVHWFramesContext*)frame->hw_frames_ctx->data;
+            format = hwfc->sw_format;
+        } else
+            format = (AVPixelFormat) frame->format;
+
+        if (format == pix_fmt && width == frame->width && height == frame->height)
             return true;
         return false;
     }
 
-    bool init(AVFrame *frame, const vk::raii::Device& device, uint32_t queueFamily, vk::Format swap_format) {
-        pix_fmt = (AVPixelFormat) frame->format;
+    bool init(const AVFrame *frame, const vk::raii::Device& device, uint32_t queueFamily, vk::Format swap_format) {
+        if (frame->hw_frames_ctx) {
+            // Access the frame context structural layer
+            AVHWFramesContext *hwfc = (AVHWFramesContext*)frame->hw_frames_ctx->data;
+            pix_fmt = hwfc->sw_format;
+        } else
+            pix_fmt = (AVPixelFormat) frame->format;
         width = frame->width;
         height = frame->height;
         fmt_desc = av_pix_fmt_desc_get(pix_fmt);
@@ -270,7 +321,7 @@ public:
 			bpp = (fmt_desc->comp[0].depth + 7) / 8;
 		}
 
-        switch (frame->format) {
+        switch (pix_fmt) {
             case AV_PIX_FMT_YUV420P:
                 format = vk::Format::eG8B8R83Plane420Unorm;
                 break;
@@ -287,8 +338,6 @@ public:
                 auto msg = std::format("Unsupported pix fmt: {}", av_get_pix_fmt_name(pix_fmt));
                 throw std::runtime_error(msg.c_str());
         }
-
-        auto colorspace = frame->colorspace == AVCOL_SPC_UNSPECIFIED ? AVCOL_SPC_BT709 : frame->colorspace;
 
         //Create the VkSamplerYcbcrConversion
         vk::SamplerYcbcrConversionCreateInfo ycbcrInfo{
@@ -432,20 +481,133 @@ public:
 		pipeline = vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
 	}
 
-    void upload(AVFrame *frame, const vk::raii::Device& device, const vk::raii::Queue& queue, double play_time) {
+    void upmap(VkFrame& vf, const vk::raii::Device& device, const vk::raii::Queue& queue) {
+        auto frame = vf.frame_data.frame;
+
+        AVFrame *drm_frame = ff::frame_alloc();
+        // Map VAAPI surface to DRM PRIME
+        drm_frame->format = AV_PIX_FMT_DRM_PRIME;
+        int err = av_hwframe_map(drm_frame, frame, AV_HWFRAME_MAP_READ);
+        if (err < 0) {
+            ff::frame_recycle(drm_frame);
+            std::println("av_hwframe_map failed.");
+            return;
+        }
+        vf.frame_data.mapped = drm_frame;
+
+        vf.imageView = nullptr;
+
+        // drm_frame->data[0] now contains a pointer to an AVDRMFrameDescriptor struct
+        AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)drm_frame->data[0];
+
+        // Example assumes an NV12 frame (1 Layer, 2 Planes: Y and UV)
+        AVDRMObjectDescriptor *obj = &desc->objects[0]; // The underlying memory chunk
+//        AVDRMLayerDescriptor *layer = &desc->layers[0];
+
+        int dma_buf_fd = obj->fd;
+        uint64_t drm_modifier = obj->format_modifier;
+
+        vk::SubresourceLayout plane_layouts[desc->nb_layers]{};
+        for (auto i = 0; i < desc->nb_layers; i++) {
+            plane_layouts[i].rowPitch = desc->layers[i].planes[0].pitch;
+            plane_layouts[i].offset = desc->layers[i].planes[0].offset;
+        }
+        vk::ImageDrmFormatModifierExplicitCreateInfoEXT modifier_info = {
+            .drmFormatModifier = drm_modifier,
+            .drmFormatModifierPlaneCount = (uint32_t) desc->nb_layers,
+            .pPlaneLayouts = plane_layouts
+        };
+        // 2. Declare external memory capabilities
+        vk::ExternalMemoryImageCreateInfo external_memory_img_info = {
+            .pNext = &modifier_info,
+            .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT
+        };
+        // 3. Create the Image
+        vk::ImageCreateInfo img_info = {
+            .pNext = &external_memory_img_info,
+            .imageType = vk::ImageType::e2D,
+            .format = format, // NV12 matching Vulkan layout
+            .extent = { .width = (uint32_t) frame->width, .height = (uint32_t) frame->height, .depth = 1 },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .tiling = vk::ImageTiling::eDrmFormatModifierEXT, // Required for DRM modifiers
+            .usage = vk::ImageUsageFlagBits::eSampled,
+            .sharingMode = vk::SharingMode::eExclusive
+        };
+        vf.image = device.createImage(img_info);
+
+        // Dup the file descriptor because Vulkan takes ownership and closes it upon import
+        int imported_fd = dup(dma_buf_fd);
+
+        vk::MemoryDedicatedAllocateInfo dedicatedAllocInfo{
+            .image = vf.image
+        };
+        vk::ImportMemoryFdInfoKHR import_fd_info = {
+            .pNext = &dedicatedAllocInfo,
+            .handleType = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT,
+            .fd = imported_fd
+        };
+        // Query memory requirements for your image
+        auto req = vf.image.getMemoryRequirements();
+        vk::MemoryAllocateInfo alloc_info = {
+            .pNext = &import_fd_info,
+            .allocationSize = req.size,
+            .memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal),
+        };
+        vf.memory = device.allocateMemory(alloc_info);
+        vf.image.bindMemory(vf.memory, 0);
+
+        // Create the VkImageView with Conversion Info
+        vk::SamplerYcbcrConversionInfo viewConversionInfo = {
+            .conversion = ycbcrConversion
+        };
+        vk::ImageViewCreateInfo viewInfo{};
+        viewInfo.pNext = &viewConversionInfo; // <-- Crucial!
+        viewInfo.image = vf.image;     // The VkImage containing your uploaded AVFrame data
+        viewInfo.viewType = vk::ImageViewType::e2D;
+        viewInfo.format = format;
+        viewInfo.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor; // Vulkan handles sub-planes internally
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.layerCount = 1;
+        vf.imageView = device.createImageView(viewInfo);
+
+        //Update the Descriptor Set
+        vk::DescriptorImageInfo imageInfo{
+            .imageView = vf.imageView,
+            .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+        };
+        vk::WriteDescriptorSet descriptorWrites[] = {
+            {
+                .dstSet = vf.set,
+                .dstBinding = 0,
+                .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                .pImageInfo = &imageInfo,
+            },
+        };
+        device.updateDescriptorSets(descriptorWrites, nullptr);
+        
+        vf.status = VkFrame::Upload;
+    }
+
+    void upload(AvFrameData frame_data, const vk::raii::Device& device, const vk::raii::Queue& queue) {
         auto next_idx = (frame_idx + 1) % N_FRAMES;
-        auto& fd = frames[next_idx];
-        auto err = device.waitForFences(*fd.copyFence, vk::True, 0);
+        auto& vf = frames[next_idx];
+        auto err = device.waitForFences(*vf.copyFence, vk::True, UINT64_MAX);
         if (err != vk::Result::eSuccess)
             return;
 
-		if (fd.frame)
-			ff::frame_recycle(fd.frame);
-		fd.frame = frame;
+        vf.frame_data = std::move(frame_data);
+        AVFrame *frame = vf.frame_data.frame;
+        if (frame->hw_frames_ctx) {
+            upmap(vf, device, queue);
+            return;
+        }
 
         int offset[4]{};
         // Upload to Buffer:
-        uint8_t *map = (uint8_t *) fd.upload_buffer_memory.mapMemory(0, upload_size);
+        uint8_t *map = (uint8_t *) vf.upload_buffer_memory.mapMemory(0, upload_size);
         uint8_t *src = frame->data[0];
         auto map_save = map;
         auto bytes_per_line = width * bpp;
@@ -479,16 +641,16 @@ public:
         range[0].size = upload_size;
         err = vkFlushMappedMemoryRanges(v->Device, 1, range);
         check_vk_result(err);*/
-        fd.upload_buffer_memory.unmapMemory();
+        vf.upload_buffer_memory.unmapMemory();
 
         // Start command buffer
         {
-            device.resetFences(*fd.copyFence);
-            fd.commandBuffer.reset();
+            device.resetFences(*vf.copyFence);
+            vf.commandBuffer.reset();
             vk::CommandBufferBeginInfo begin_info{
                 .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit
             };
-            fd.commandBuffer.begin(begin_info);
+            vf.commandBuffer.begin(begin_info);
         }
 
         // Copy to Image:
@@ -498,23 +660,23 @@ public:
                 .dstAccessMask = vk::AccessFlagBits::eTransferRead,
                 .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
                 .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
-                .buffer = *fd.upload_buffer,
+                .buffer = *vf.upload_buffer,
                 .size = upload_size,
             };
             vk::ImageMemoryBarrier imageBarrier = {
                 .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
-                .oldLayout = fd.status == VkFrame::New ? vk::ImageLayout::eUndefined : vk::ImageLayout::eShaderReadOnlyOptimal,
+                .oldLayout = vf.status == VkFrame::New ? vk::ImageLayout::eUndefined : vk::ImageLayout::eShaderReadOnlyOptimal,
                 .newLayout = vk::ImageLayout::eTransferDstOptimal,
                 .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
                 .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
-                .image = *fd.image,
+                .image = *vf.image,
                 .subresourceRange = {
                     .aspectMask = vk::ImageAspectFlags::BitsType::eColor,
                     .levelCount = 1,
                     .layerCount = 1,
                 },
             };
-            fd.commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eFragmentShader | vk::PipelineStageFlagBits::eHost, vk::PipelineStageFlagBits::eTransfer, {}, nullptr, bufferBarrier, imageBarrier);
+            vf.commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eFragmentShader | vk::PipelineStageFlagBits::eHost, vk::PipelineStageFlagBits::eTransfer, {}, nullptr, bufferBarrier, imageBarrier);
 
             std::vector<vk::BufferImageCopy2> planeCopies(n_planes);
             if (n_planes > 1) {
@@ -539,13 +701,13 @@ public:
             }
 
             vk::CopyBufferToImageInfo2 copy_info = {
-                .srcBuffer = fd.upload_buffer,
-                .dstImage = fd.image,
+                .srcBuffer = vf.upload_buffer,
+                .dstImage = vf.image,
                 .dstImageLayout = vk::ImageLayout::eTransferDstOptimal,
                 .regionCount = (uint32_t) planeCopies.size(),
                 .pRegions = planeCopies.data(),
             };
-            fd.commandBuffer.copyBufferToImage2(copy_info);
+            vf.commandBuffer.copyBufferToImage2(copy_info);
 
             imageBarrier = {
                 .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
@@ -554,45 +716,44 @@ public:
                 .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
                 .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
                 .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
-                .image = *fd.image,
+                .image = *vf.image,
                 .subresourceRange = {
                     .aspectMask = vk::ImageAspectFlags::BitsType::eColor,
                     .levelCount = 1,
                     .layerCount = 1,
                 },
             };
-            fd.commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eFragmentShader, {}, nullptr, nullptr, imageBarrier);
+            vf.commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eFragmentShader, {}, nullptr, nullptr, imageBarrier);
         }
 
         // End command buffer
         {
-            fd.commandBuffer.end();
+            vf.commandBuffer.end();
             vk::SubmitInfo end_info = {};
             end_info.commandBufferCount = 1;
-            end_info.pCommandBuffers = &*fd.commandBuffer;
-            queue.submit(end_info, fd.copyFence);
+            end_info.pCommandBuffers = &*vf.commandBuffer;
+            queue.submit(end_info, vf.copyFence);
         }
 
-        fd.status = VkFrame::Upload;
-        fd.play_time = play_time;
+        vf.status = VkFrame::Upload;
 //        queue.waitIdle();
     }
 
     bool check_next_frame(double play_time, const vk::Device& device) {
         auto next_idx = (frame_idx + 1) % N_FRAMES;
-        auto& fd = frames[next_idx];
-        if (fd.status == VkFrame::Upload) {
-            if (fd.play_time <= play_time) {
-                auto err = device.waitForFences(*fd.copyFence, vk::True, 0);
+        auto& vf = frames[next_idx];
+        if (vf.status == VkFrame::Upload) {
+            if (vf.frame_data.play_time <= play_time) {
+                auto err = device.waitForFences(*vf.copyFence, vk::True, 0);
                 if (err == vk::Result::eSuccess) {
-                    fd.status = VkFrame::Ready;
+                    vf.status = VkFrame::Ready;
                     frame_idx = next_idx;
                     return true;
                 }
             }
             return false;
-        } else if (fd.status == VkFrame::Discard) {
-            auto err = device.waitForFences(*fd.copyFence, vk::True, 0);
+        } else if (vf.status == VkFrame::Discard) {
+            auto err = device.waitForFences(*vf.copyFence, vk::True, 0);
             if (err == vk::Result::eSuccess) {
                 return true;
             }
@@ -606,9 +767,9 @@ public:
 
     void discard_pending() {
         auto next_idx = (frame_idx + 1) % N_FRAMES;
-        auto& fd = frames[next_idx];
-        if (fd.status == VkFrame::Upload) {
-            fd.status = VkFrame::Discard;
+        auto& vf = frames[next_idx];
+        if (vf.status == VkFrame::Upload) {
+            vf.status = VkFrame::Discard;
         }
     }
 };

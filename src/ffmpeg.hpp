@@ -571,14 +571,7 @@ public:
                                 set_seeking(false);
                             }
                             auto new_frame = frame_alloc();
-                            if (frame->hw_frames_ctx) {
-                                auto err = av_hwframe_transfer_data(new_frame, frame, 0);
-                                if (err) av_err_log("av_hwframe_transfer_data", err);
-                                av_frame_copy_props(new_frame, frame);
-                            }
-                            else {
-                                av_frame_move_ref(new_frame, frame);
-                            }
+                            av_frame_move_ref(new_frame, frame);
                             video_frame_queue.enqueue(new_frame);
                         }
                         av_frame_unref(frame);

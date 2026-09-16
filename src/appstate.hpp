@@ -448,9 +448,9 @@ public:
         }
     }
 
-    AVFrame *fetch_video_frame(double play_time) {
+    AvFrameData fetch_video_frame(double play_time) {
         AVFrame *frame = nullptr;
-        AVFrame *frame_to_display = nullptr;
+        AvFrameData data;
         while (auto pp = video.video_frame_queue.peek())
         {
             frame = *pp;
@@ -460,16 +460,17 @@ public:
                 is_seeking = false;
                 set_play_time(play_time);
             }
-            if (frame_to_display == nullptr || frame_time <= play_time) {
-                if (frame_to_display)
-                    ff::frame_recycle(frame_to_display);
-                frame_to_display = frame;
+            if (data.frame == nullptr || frame_time <= play_time) {
+                if (data.frame)
+                    ff::frame_recycle(data.frame);
+                data.frame = frame;
+                data.play_time = frame_time;
                 video.video_frame_queue.pop();
             } else {
                 break;
             }
         }
-        return frame_to_display;
+        return data;
     }
 
     void init_subtitle(AVSubtitleType type) {
@@ -677,8 +678,8 @@ public:
             auto play_time = get_play_time();
             while (gpu.check_next_frame(play_time)) {
                 auto video_frame = fetch_video_frame(play_time);
-                if (video_frame) {
-                    gpu.set_frame(video_frame, video_frame->pts * video.get_video_time_base(), app_sub);
+                if (video_frame.frame) {
+                    gpu.set_frame(std::move(video_frame), app_sub);
                 } else {
                     if (video.is_eof.load(std::memory_order_relaxed)) {
                         auto duration = video.get_duration();
