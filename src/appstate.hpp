@@ -115,6 +115,7 @@ public:
             if (sub)
                 sub->flush();
         }, app_sub);
+        gpu.discard_pending();
 
         AVFrame *frame;
         while (video.video_frame_queue.try_dequeue(frame))
@@ -447,7 +448,7 @@ public:
         }
     }
 
-    AVFrame *check_video_frame(double play_time) {
+    AVFrame *fetch_video_frame(double play_time) {
         AVFrame *frame = nullptr;
         AVFrame *frame_to_display = nullptr;
         while (auto pp = video.video_frame_queue.peek())
@@ -459,7 +460,7 @@ public:
                 is_seeking = false;
                 set_play_time(play_time);
             }
-            if (frame_time <= play_time) {
+            if (frame_to_display == nullptr || frame_time <= play_time) {
                 if (frame_to_display)
                     ff::frame_recycle(frame_to_display);
                 frame_to_display = frame;
@@ -674,18 +675,22 @@ public:
             check_audio_frame();
             check_subtitle();
             auto play_time = get_play_time();
-            auto video_frame = check_video_frame(play_time);
-            if (video_frame) {
-                gpu.set_frame(video_frame, play_time, app_sub);
-            } else if (video.is_eof.load(std::memory_order_relaxed)) {
-                auto duration = video.get_duration();
-                if (duration <= play_time) {
-                    if (is_loop && duration > 0.5 && seek(video.get_start_time())) {
-                    } else
-                        set_video_play(false);
+            while (gpu.check_next_frame(play_time)) {
+                auto video_frame = fetch_video_frame(play_time);
+                if (video_frame) {
+                    gpu.set_frame(video_frame, video_frame->pts * video.get_video_time_base(), app_sub);
+                } else {
+                    if (video.is_eof.load(std::memory_order_relaxed)) {
+                        auto duration = video.get_duration();
+                        if (duration <= play_time) {
+                            if (is_loop && duration > 0.5 && seek(video.get_start_time())) {
+                            } else
+                                set_video_play(false);
+                        }
+                    }
+                    break;
                 }
             }
-            gpu.check_next_frame(play_time);
         }
 
         gpu.render(app_sub);

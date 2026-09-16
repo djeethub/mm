@@ -352,6 +352,8 @@ private:
 
 	static vk::PresentModeKHR chooseSwapPresentMode(std::vector<vk::PresentModeKHR> const &availablePresentModes)
 	{
+		return vk::PresentModeKHR::eFifo;
+		std::unreachable();
 		assert(std::ranges::any_of(availablePresentModes, [](auto presentMode) { return presentMode == vk::PresentModeKHR::eFifo; }));
 		return std::ranges::any_of(availablePresentModes,
 		                           [](const vk::PresentModeKHR value) { return vk::PresentModeKHR::eMailbox == value; }) ?
@@ -582,16 +584,13 @@ public:
         video.upload(frame, device, queue, play_time);
     }
 
-    void check_next_frame(double play_time) {
-        video.check_next_frame(play_time);
+    bool check_next_frame(double play_time) {
+        return video.check_next_frame(play_time, device);
     }
 
 	void render_frame(const vk::CommandBuffer& commandBuffer) {
         auto& fd = video.get_current_frame();
-        if (fd.status != VkFrame::Display)
-            return;
-        auto err = device.waitForFences(*fd.copyFence, vk::True, UINT64_MAX);
-        if (err != vk::Result::eSuccess)
+        if (fd.status != VkFrame::Ready)
             return;
 
         commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *video.pipeline);
@@ -771,4 +770,8 @@ public:
         ImGui_ImplVulkan_Init(&init_info);
         ImGui_ImplVulkan_SetMinImageCount(min_image_count);
     }
+
+	void discard_pending() {
+		video.discard_pending();
+	}
 };

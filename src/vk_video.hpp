@@ -42,7 +42,8 @@ struct VkFrame {
         None,
         New,
         Upload,
-        Display
+        Discard,
+        Ready,
     };
 
     vk::raii::Image image = nullptr;
@@ -63,7 +64,7 @@ struct VkFrame {
 
 class VkVideo {
 private:
-    inline static const int N_FRAMES = 3;
+    inline static const int N_FRAMES = 2;
 
     vk::raii::SamplerYcbcrConversion ycbcrConversion = nullptr;
     vk::raii::DescriptorSetLayout layout = nullptr;
@@ -577,16 +578,37 @@ public:
 //        queue.waitIdle();
     }
 
-    void check_next_frame(double play_time) {
+    bool check_next_frame(double play_time, const vk::Device& device) {
         auto next_idx = (frame_idx + 1) % N_FRAMES;
         auto& fd = frames[next_idx];
-        if (fd.status == VkFrame::Upload && fd.play_time <= play_time) {
-            fd.status = VkFrame::Display;
-            frame_idx = next_idx;
+        if (fd.status == VkFrame::Upload) {
+            if (fd.play_time <= play_time) {
+                auto err = device.waitForFences(*fd.copyFence, vk::True, 0);
+                if (err == vk::Result::eSuccess) {
+                    fd.status = VkFrame::Ready;
+                    frame_idx = next_idx;
+                    return true;
+                }
+            }
+            return false;
+        } else if (fd.status == VkFrame::Discard) {
+            auto err = device.waitForFences(*fd.copyFence, vk::True, 0);
+            if (err == vk::Result::eSuccess) {
+                return true;
+            }
         }
+        return true;
     }
 
     VkFrame& get_current_frame() {
         return frames[frame_idx];
+    }
+
+    void discard_pending() {
+        auto next_idx = (frame_idx + 1) % N_FRAMES;
+        auto& fd = frames[next_idx];
+        if (fd.status == VkFrame::Upload) {
+            fd.status = VkFrame::Discard;
+        }
     }
 };
