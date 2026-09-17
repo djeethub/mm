@@ -274,8 +274,8 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     auto *state = static_cast<AppState*>(appstate);
     if (state) {
         SDL_SetWindowHitTest(state->window, nullptr, nullptr);
-        state->shutdown();
         state->gpu.wait_for_idle();
+        state->shutdown();
         gui.shutdown();
         delete state;
     }

@@ -8,7 +8,7 @@ struct SpriteInstance {
     vec4 color;
 };
 
-layout(std140, set = 0, binding = 0) readonly buffer SpriteBuffer {
+layout(std430, set = 0, binding = 1) readonly buffer SpriteBuffer {
     SpriteInstance sprites[];
 };
 

@@ -1,17 +1,16 @@
 #pragma once
 
+#include "vk_util.hpp"
+
+#define N_INFLIGHT 3
+
 template <typename T>
 class GPUPool {
 protected:
     std::vector<T *> in_use_list;
     std::vector<T *> list;
-    SDL_GPUDevice *device;
 
 public:
-    void init(SDL_GPUDevice *device) {
-        this->device = device;
-    }
-
     auto get_in_use() {
         return in_use_list;
     }
@@ -34,31 +33,34 @@ public:
         }
     }
 
-    void destroy(T *data) {
-        data->destroy(device);
-    }
-
     void clear() {
         recycle();
         for (auto data : list) {
-            destroy(data);
+            delete data;
         }
         list.clear();
-    }
+    }    
 };
 
 class AppSubtitle {
 protected:
-    SDL_GPUDevice *device = nullptr;
-    SDL_GPUGraphicsPipeline *pipeline = nullptr;
-    SDL_GPUSampler *sampler = nullptr;
+    const vk::raii::Device& device;
+    vk::raii::Sampler sampler = nullptr;
+    vk::raii::DescriptorSetLayout layout = nullptr;
+    vk::raii::DescriptorPool pool = nullptr;
+    std::vector<vk::raii::DescriptorSet> sets;
+    vk::raii::PipelineLayout pipelineLayout = nullptr;
+    vk::raii::Pipeline pipeline = nullptr;
+    vk::raii::CommandPool commandPool = nullptr;
+    vk::raii::Queue queue = nullptr;
+
     int wnd_w = 0;
     int wnd_h = 0;
 
 public:
-    AppSubtitle(SDL_GPUDevice *gpu) : device(gpu) {}
+    AppSubtitle(const vk::raii::Device& gpu) : device(gpu) {}
 };
 
 class SubAss;
 class SubBitmap;
-using AppSub = std::variant<SubAss *, SubBitmap *>;
+using AppSub = std::variant<SubAss *>;//, SubBitmap *>;

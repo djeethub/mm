@@ -7,12 +7,14 @@
 #include "ass.vert.h"
 #include "ass.frag.h"
 
-struct alignas(16) AtlasRegion {
+#define N_DATA 2
+
+struct AtlasRegion {
     float u0, v0; // Top-Left UV
     float u1, v1; // Bottom-Right UV
 };
 
-struct alignas(16) Vertex {
+struct Vertex {
     float x, y;
     float w, h;
     AtlasRegion uv;
@@ -20,13 +22,17 @@ struct alignas(16) Vertex {
 };
 
 struct Atlas {
-    SDL_GPUTexture *tex;
+    vk::raii::Image image = nullptr;
+    vk::raii::DeviceMemory memory = nullptr;
+    vk::raii::ImageView imageView = nullptr;
+    vk::raii::Buffer up_buffer = nullptr;
+    vk::raii::DeviceMemory up_memory = nullptr;
+    vk::raii::Buffer *vert_buf = nullptr;
+    int vert_size;
     Uint32 w;
     Uint32 h;
-    SDL_GPUTransferBuffer *buf;
     std::vector<Vertex> vertices;
-
-    SDL_GPUBuffer *vert_buf;
+    bool newly_created = true;
 
 // Shelf packer state
     uint32_t current_x = 0;
@@ -80,183 +86,229 @@ struct Atlas {
         offset = 0;
         vert_buf = nullptr;
     }
-
-    void destroy(SDL_GPUDevice* gpu) {
-        if (tex)
-            SDL_ReleaseGPUTexture(gpu, tex);
-        if (buf)
-            SDL_ReleaseGPUTransferBuffer(gpu, buf);
-        delete this;
-    }
 };
 
 class AtlasPool : public GPUPool<Atlas> {
 public:
-    Atlas *alloc(Uint32 w, Uint32 h) {
+    using GPUPool<Atlas>::GPUPool;
+
+    Atlas *alloc(const vk::raii::Device&device, Uint32 w, Uint32 h) {
         if (!list.empty()) {
             auto data = list.back();
             list.pop_back();
             return data;
         }
 
-        SDL_GPUTextureCreateInfo tex_info = {};
-        tex_info.type = SDL_GPU_TEXTURETYPE_2D;
-        tex_info.format = SDL_GPU_TEXTUREFORMAT_R8_UNORM;
-        tex_info.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
-        tex_info.width = w;
-        tex_info.height = h;
-        tex_info.layer_count_or_depth = 1;
-        tex_info.num_levels = 1;
-        auto tex = SDL_CreateGPUTexture(device, &tex_info);
-        if (!tex)
-            return nullptr;
+        auto atlas = new Atlas{.w = w, .h = h};
 
-        SDL_GPUTransferBufferCreateInfo tb_info = {
-			.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
-			.size = w * h,
-		};
-		auto buf = SDL_CreateGPUTransferBuffer(device, &tb_info);
-        if (!buf) {
-            SDL_ReleaseGPUTexture(device, tex);
-            return nullptr;
-        }
- 
-        return new Atlas {
-            .tex = tex,
-            .w = w,
-            .h = h,
-            .buf = buf,
+        vk::ImageCreateInfo info = {
+            .imageType = vk::ImageType::e2D,
+            .format = vk::Format::eR8Unorm,
+            .extent = { .width = (uint32_t) w, .height = (uint32_t) h, .depth = 1 },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .tiling = vk::ImageTiling::eOptimal,
+            .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
+            .sharingMode = vk::SharingMode::eExclusive,
+            .initialLayout = vk::ImageLayout::eUndefined,
         };
+        atlas->image = device.createImage(info);
+        auto req = atlas->image.getMemoryRequirements();
+        vk::MemoryAllocateInfo mem_alloc_info = {};
+        mem_alloc_info.allocationSize = req.size;
+        mem_alloc_info.memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal);
+        atlas->memory = device.allocateMemory(mem_alloc_info);
+        atlas->image.bindMemory(atlas->memory, 0);
+
+        vk::ImageViewCreateInfo viewInfo{
+            .image = atlas->image,     // The VkImage containing your uploaded AVFrame data
+            .viewType = vk::ImageViewType::e2D,
+            .format = info.format,
+            .subresourceRange = {
+                .aspectMask = vk::ImageAspectFlagBits::eColor, // Vulkan handles sub-planes internally
+                .levelCount = 1,
+                .layerCount = 1
+            }
+        };
+        atlas->imageView = device.createImageView(viewInfo);
+        
+        auto upload_size = w * h;
+        {
+            vk::BufferCreateInfo buffer_info = {
+                .size = upload_size,
+                .usage = vk::BufferUsageFlagBits::eTransferSrc,
+                .sharingMode = vk::SharingMode::eExclusive
+            };
+            atlas->up_buffer = device.createBuffer(buffer_info);
+            auto req = atlas->up_buffer.getMemoryRequirements();
+            vk::MemoryAllocateInfo alloc_info = {
+                .allocationSize = req.size,
+                .memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)
+            };
+            atlas->up_memory = device.allocateMemory(alloc_info);
+            atlas->up_buffer.bindMemory(atlas->up_memory, 0);
+        }
+
+        return atlas;
     }
 };
 
 struct VertexBuf {
-    SDL_GPUBuffer *buf;
-    SDL_GPUTransferBuffer *xfer_buf;
+    vk::raii::Buffer buf = nullptr;
+    vk::raii::DeviceMemory memory = nullptr;
     Uint32 size;
-
-    void destroy(SDL_GPUDevice *device) {
-        if (buf)
-            SDL_ReleaseGPUBuffer(device, buf);
-        if (xfer_buf)
-            SDL_ReleaseGPUTransferBuffer(device, xfer_buf);
-        delete this;
-    }
 
     void reset() {}
 };
 
 class VertexPool : public GPUPool<VertexBuf> {
 public:
-    VertexBuf *alloc(Uint32 size) {
+    using GPUPool<VertexBuf>::GPUPool;
+
+    VertexBuf *alloc(const vk::raii::Device& device, Uint32 size) {
         while (!list.empty()) {
             auto data = list.back();
             list.pop_back();
             if (data->size >= size)
                 return data;
-            data->destroy(device);
+            delete data;
         }
 
         size *= 3;
-        SDL_GPUBufferCreateInfo vb_info = {
-            .usage = SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ,
-            .size = size
-        };
-        auto buf = SDL_CreateGPUBuffer(device, &vb_info);
-        if (!buf)
-            return nullptr;
+        auto vert_buf = new VertexBuf{.size = size};
 
-        SDL_GPUTransferBufferCreateInfo tb_info = {
-			.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
-			.size = size,
-		};
-		auto xfer_buf = SDL_CreateGPUTransferBuffer(device, &tb_info);
-        if (!xfer_buf) {
-            SDL_ReleaseGPUBuffer(device, buf);
-            return nullptr;
-        }
- 
-        return new VertexBuf {
-            .buf = buf,
-            .xfer_buf = xfer_buf,
-            .size = size
+        vk::BufferCreateInfo buffer_info = {
+            .size = size,
+            .usage = vk::BufferUsageFlagBits::eStorageBuffer,
+            .sharingMode = vk::SharingMode::eExclusive
         };
+        vert_buf->buf = device.createBuffer(buffer_info);
+        auto req = vert_buf->buf.getMemoryRequirements();
+        vk::MemoryAllocateInfo alloc_info = {
+            .allocationSize = req.size,
+            .memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)
+        };
+        vert_buf->memory = device.allocateMemory(alloc_info);
+        vert_buf->buf.bindMemory(vert_buf->memory, 0);
+
+        return vert_buf;
     }
+};
+
+struct AssData {
+    vk::raii::CommandBuffer commandBuffer = nullptr;
+    vk::raii::Fence copyFence = nullptr;
+
+    AtlasPool atlas_pool;
+    VertexPool vertex_pool;
 };
 
 class SubAss : public AppSubtitle {
 private:
+    enum Status {
+        Idle,
+        Init,
+    };
+
+    std::vector<AssData> data;
+    int frameIdx = 0;
+    int dataIdx = 0;
+
     ASS_Library *ass_library = nullptr;
     ASS_Renderer *ass_renderer = nullptr;
     ASS_Track *ass_track = nullptr;
-    AtlasPool atlas_pool;
-    VertexPool vertex_pool;
+    
+    std::vector<vk::BufferImageCopy2> regions;
+    Status status_upload = Idle;
 
-    bool init_pipeline(SDL_Window *window) {
-        if (pipeline)
-            return true;
-
-		SDL_GPUShaderCreateInfo shader_info = {
-            .code_size = ass_vert_len,
-            .code = ass_vert,
-			.entrypoint = "main",
-			.format = SDL_GPU_SHADERFORMAT_SPIRV,
-            .stage = SDL_GPU_SHADERSTAGE_VERTEX,
-            .num_storage_buffers = 1,
-            .num_uniform_buffers = 0,
-		};
-        SDL_GPUShader *vert_shader = SDL_CreateGPUShader(device, &shader_info);
-        shader_info.code_size = ass_frag_len,
-        shader_info.code = ass_frag;
-        shader_info.stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
-		shader_info.num_samplers = 1;
-        shader_info.num_storage_buffers = 0;
-    	shader_info.num_uniform_buffers = 0;
-        SDL_GPUShader *frag_shader = SDL_CreateGPUShader(device, &shader_info);
-
-        auto color_desc = SDL_GPUColorTargetDescription{
-            .format = SDL_GetGPUSwapchainTextureFormat(device, window),
-            .blend_state = {
-                .src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA,
-                .dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
-                .color_blend_op = SDL_GPU_BLENDOP_ADD,
-                .src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE,
-                .dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
-                .alpha_blend_op = SDL_GPU_BLENDOP_ADD,
-                .enable_blend = true,
-            }
+	void createGraphicsPipeline(const vk::raii::Device& device, vk::Format swap_format)
+	{
+        vk::ShaderModuleCreateInfo shader_info{
+            .codeSize = ass_vert_len,
+            .pCode = (uint32_t *) ass_vert,
         };
-        SDL_GPUGraphicsPipelineCreateInfo pipeline_info = {
-            .vertex_shader = vert_shader,
-            .fragment_shader = frag_shader,
-            .primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
-            .target_info = {
-                .color_target_descriptions = &color_desc,
-                .num_color_targets = 1,
+        auto vert_shader = device.createShaderModule(shader_info);
+        shader_info = vk::ShaderModuleCreateInfo{
+            .codeSize = ass_frag_len,
+            .pCode = (uint32_t *) ass_frag,
+        };
+        auto frag_shader = device.createShaderModule(shader_info);
+
+		vk::PipelineShaderStageCreateInfo vertShaderStageInfo{.stage = vk::ShaderStageFlagBits::eVertex, .module = vert_shader, .pName = "main"};
+		vk::PipelineShaderStageCreateInfo fragShaderStageInfo{.stage = vk::ShaderStageFlagBits::eFragment, .module = frag_shader, .pName = "main"};
+		vk::PipelineShaderStageCreateInfo shaderStages[] = {vertShaderStageInfo, fragShaderStageInfo};
+
+		vk::PipelineVertexInputStateCreateInfo   vertexInputInfo{.vertexBindingDescriptionCount   = 0,
+		                                                         .pVertexBindingDescriptions      = nullptr,
+		                                                         .vertexAttributeDescriptionCount = 0,
+		                                                         .pVertexAttributeDescriptions    = nullptr};
+		vk::PipelineInputAssemblyStateCreateInfo inputAssembly{.topology = vk::PrimitiveTopology::eTriangleList};
+
+		vk::PipelineViewportStateCreateInfo      viewportState{.viewportCount = 1, .scissorCount = 1};
+
+		vk::PipelineRasterizationStateCreateInfo rasterizer{.depthClampEnable        = vk::False,
+		                                                    .rasterizerDiscardEnable = vk::False,
+		                                                    .polygonMode             = vk::PolygonMode::eFill,
+		                                                    .cullMode                = vk::CullModeFlagBits::eNone,
+		                                                    .frontFace               = vk::FrontFace::eCounterClockwise,
+		                                                    .depthBiasEnable         = vk::False,
+		                                                    .lineWidth               = 1.0f};
+
+		vk::PipelineMultisampleStateCreateInfo multisampling{.rasterizationSamples = vk::SampleCountFlagBits::e1, .sampleShadingEnable = vk::False};
+
+		vk::PipelineColorBlendAttachmentState colorBlendAttachment{
+		    .blendEnable    = vk::True,
+            .srcColorBlendFactor = vk::BlendFactor::eSrcAlpha,
+            .dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha,
+            .colorBlendOp = vk::BlendOp::eAdd,
+            .srcAlphaBlendFactor = vk::BlendFactor::eOne,
+            .dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha,
+            .alphaBlendOp = vk::BlendOp::eAdd,
+		    .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG | vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA};
+
+		vk::PipelineColorBlendStateCreateInfo colorBlending{
+		    .logicOpEnable = vk::False, .logicOp = vk::LogicOp::eCopy, .attachmentCount = 1, .pAttachments = &colorBlendAttachment};
+
+		std::vector<vk::DynamicState>      dynamicStates = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+		vk::PipelineDynamicStateCreateInfo dynamicState{.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size()), .pDynamicStates = dynamicStates.data()};
+
+		vk::PipelineLayoutCreateInfo pipelineLayoutInfo{.setLayoutCount = 1, .pSetLayouts = &*layout, .pushConstantRangeCount = 0, .pPushConstantRanges = {}};
+		pipelineLayout = vk::raii::PipelineLayout(device, pipelineLayoutInfo);
+
+		vk::StructureChain<vk::GraphicsPipelineCreateInfo, vk::PipelineRenderingCreateInfo> pipelineCreateInfoChain = {
+		    {
+                .stageCount          = 2,
+                .pStages             = shaderStages,
+   		        .pVertexInputState   = &vertexInputInfo,
+                .pInputAssemblyState = &inputAssembly,
+                .pViewportState      = &viewportState,
+                .pRasterizationState = &rasterizer,
+                .pMultisampleState   = &multisampling,
+                .pColorBlendState    = &colorBlending,
+                .pDynamicState       = &dynamicState,
+                .layout              = pipelineLayout,
             },
+		    {.colorAttachmentCount = 1, .pColorAttachmentFormats = &swap_format}
         };
 
-        pipeline = SDL_CreateGPUGraphicsPipeline(device, &pipeline_info);
-        SDL_ReleaseGPUShader(device, vert_shader);
-		SDL_ReleaseGPUShader(device, frag_shader);
-        return pipeline != nullptr;
-    }
+		pipeline = vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
+	}
 
 public:
-    SubAss(SDL_GPUDevice *gpu) : AppSubtitle(gpu) {
-        init_once(gpu);
+    SubAss(const vk::raii::Device& gpu) : AppSubtitle(gpu) {
+        init_once();
     }
     ~SubAss() {
         shutdown();
     }
 
     void shutdown() {
-        SDL_ReleaseGPUGraphicsPipeline(device, pipeline);
-        pipeline = nullptr;
-        SDL_ReleaseGPUSampler(device, sampler);
-        sampler = nullptr;
-        atlas_pool.clear();
-        vertex_pool.clear();
+        for (auto& ad : data) {
+            ad.atlas_pool.clear();
+            ad.vertex_pool.clear();
+        }
+
         if (ass_track) {
             ass_free_track(ass_track);
             ass_track = nullptr;
@@ -271,19 +323,89 @@ public:
         }
     }
 
-    void init_once(SDL_GPUDevice *gpu) {
-        device = gpu;
-        atlas_pool.init(device);
-        vertex_pool.init(device);
+    void init_once() {
+        vk::SamplerCreateInfo info = {
+            .magFilter = vk::Filter::eLinear,
+            .minFilter = vk::Filter::eLinear,
+            .mipmapMode = vk::SamplerMipmapMode::eLinear,
+            .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+            .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+            .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+/*            .maxAnisotropy = 1.0f,
+            .minLod = -1000,
+            .maxLod = 1000,*/
+        };
+        sampler = device.createSampler(info);
 
-		SDL_GPUSamplerCreateInfo samp_info = {
-			.min_filter = SDL_GPU_FILTER_LINEAR,
-			.mag_filter = SDL_GPU_FILTER_LINEAR,
-			.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
-			.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
-			.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
-		};
-		sampler = SDL_CreateGPUSampler(device, &samp_info);
+        // Define the Descriptor Set Layout with an Immutable Sampler
+        vk::DescriptorSetLayoutBinding bindings[] = {
+            {
+                .binding = 0,
+                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                .descriptorCount = 1,
+                .stageFlags = vk::ShaderStageFlagBits::eFragment,
+                .pImmutableSamplers = &*sampler // <-- Baked directly into the layout binding!
+            },
+            {
+                .binding = 1,
+                .descriptorType = vk::DescriptorType::eStorageBuffer,
+                .descriptorCount = 1,
+                .stageFlags = vk::ShaderStageFlagBits::eVertex,
+            },
+        };
+        vk::DescriptorSetLayoutCreateInfo layoutInfo{
+            .bindingCount = 2,
+            .pBindings = bindings,
+        };
+        layout = device.createDescriptorSetLayout(layoutInfo);
+
+        vk::DescriptorPoolSize pool_sizes[] =
+        {
+            { vk::DescriptorType::eCombinedImageSampler, N_INFLIGHT },
+            { vk::DescriptorType::eStorageBuffer, N_INFLIGHT },
+        };
+        vk::DescriptorPoolCreateInfo pool_info{
+            .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+            .maxSets = N_INFLIGHT,
+            .poolSizeCount = (uint32_t)IM_COUNTOF(pool_sizes),
+            .pPoolSizes = pool_sizes
+        };
+        pool = device.createDescriptorPool(pool_info);
+
+        std::vector<vk::DescriptorSetLayout> layouts(N_INFLIGHT, layout);
+        // Allocate a descriptor set from the pool
+        vk::DescriptorSetAllocateInfo alloc_info{
+            .descriptorPool = pool, // The pool we just created
+            .descriptorSetCount = N_INFLIGHT,
+            .pSetLayouts = layouts.data() // Your predefined VkDescriptorSetLayout
+        };
+        sets = device.allocateDescriptorSets(alloc_info);
+
+        vk::CommandPoolCreateInfo poolInfo = {
+            .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+            .queueFamilyIndex = queueIndex
+        };
+        commandPool = device.createCommandPool(poolInfo);
+
+        vk::CommandBufferAllocateInfo allocInfo = {
+            .commandPool = commandPool,
+            .level = vk::CommandBufferLevel::ePrimary,
+            .commandBufferCount = N_DATA
+        };
+        auto commandBuffers = device.allocateCommandBuffers(allocInfo);
+
+        vk::FenceCreateInfo fence_info = {
+            .flags = vk::FenceCreateFlagBits::eSignaled,
+        };
+
+        for (auto i = 0; i < N_DATA; i++) {
+            data.emplace_back(AssData{
+                .commandBuffer = std::move(commandBuffers[i]),
+                .copyFence = device.createFence(fence_info),
+            });
+        }
+
+        queue = device.getQueue(queueIndex, 0);
 
         ass_library = ass_library_init();
     }
@@ -317,7 +439,8 @@ public:
                 subtitle_codec_ctx->subtitle_header_size
             );
 
-            return init_pipeline(window);
+            createGraphicsPipeline(device, swapChainSurfaceFormat.format);
+            return true;
         }
         return false;
     }
@@ -370,27 +493,100 @@ public:
         );
     }
 
-    void upload_vertices(SDL_GPUCopyPass *pass, Atlas *atlas) {
-        Uint32 size = atlas->vertices.size() * sizeof(Vertex);
-        auto vert = vertex_pool.alloc(size);
-        auto src = atlas->vertices.data();
-        void* v_map = SDL_MapGPUTransferBuffer(device, vert->xfer_buf, true);
-        SDL_memcpy(v_map, src, size);
-        SDL_UnmapGPUTransferBuffer(device, vert->xfer_buf);
+    void upload_vertices(Atlas *atlas) {
+        auto& ad = data[dataIdx];
 
-        SDL_GPUTransferBufferLocation v_transfer = { vert->xfer_buf, 0 };
-        SDL_GPUBufferRegion v_region = { vert->buf, 0, size };
-        SDL_UploadToGPUBuffer(pass, &v_transfer, &v_region, true);
-        atlas->vert_buf = vert->buf;
-        vertex_pool.in_use(vert);
+        Uint32 size = atlas->vertices.size() * sizeof(Vertex);
+        auto vert = ad.vertex_pool.alloc(device, size);
+
+        uint8_t *map = (uint8_t *) vert->memory.mapMemory(0, size);
+        uint8_t *src = (uint8_t *) atlas->vertices.data();
+        memcpy(map, src, size);
+        vert->memory.unmapMemory();
+        atlas->vert_buf = &vert->buf;
+        atlas->vert_size = size;
+        ad.vertex_pool.in_use(vert);
     }
 
-    void prepare_draw(SDL_GPUCopyPass *pass, double play_time) {
+    void upload_atlas(Atlas *atlas, std::vector<vk::BufferImageCopy2> regions) {
+        auto& ad = data[dataIdx];
+
+        if (status_upload == Idle) {
+            auto err = device.waitForFences(*ad.copyFence, vk::True, UINT64_MAX);
+            if (err != vk::Result::eSuccess)
+                return;
+
+            device.resetFences(*ad.copyFence);
+            ad.commandBuffer.reset();
+            vk::CommandBufferBeginInfo begin_info{
+                .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit
+            };
+            ad.commandBuffer.begin(begin_info);
+            status_upload = Init;
+        }
+
+        vk::ImageMemoryBarrier2 imageBarrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader | vk::PipelineStageFlagBits2::eHost,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .oldLayout = atlas->newly_created ? vk::ImageLayout::eUndefined : vk::ImageLayout::eShaderReadOnlyOptimal,
+            .newLayout = vk::ImageLayout::eTransferDstOptimal,
+            .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
+            .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
+            .image = *atlas->image,
+            .subresourceRange = {
+                .aspectMask = vk::ImageAspectFlags::BitsType::eColor,
+                .levelCount = 1,
+                .layerCount = 1,
+            },
+        };
+        vk::DependencyInfo dep_info{
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &imageBarrier,
+        };
+        ad.commandBuffer.pipelineBarrier2(dep_info);
+
+        vk::CopyBufferToImageInfo2 copy_info = {
+            .srcBuffer = atlas->up_buffer,
+            .dstImage = atlas->image,
+            .dstImageLayout = vk::ImageLayout::eTransferDstOptimal,
+            .regionCount = (uint32_t)regions.size(),
+            .pRegions = regions.data(),
+        };
+        ad.commandBuffer.copyBufferToImage2(copy_info);
+
+        imageBarrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
+            .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
+            .image = *atlas->image,
+            .subresourceRange = {
+                .aspectMask = vk::ImageAspectFlags::BitsType::eColor,
+                .levelCount = 1,
+                .layerCount = 1,
+            },
+        };
+        dep_info = {
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &imageBarrier,
+        };
+        ad.commandBuffer.pipelineBarrier2(dep_info);
+        atlas->newly_created = false;
+    }
+
+    void prepare_draw(double play_time) {
         if (!ass_track)
             return;
 
-        atlas_pool.recycle();
-        vertex_pool.recycle();
+        dataIdx = (dataIdx + 1) % N_DATA;
+        auto& ad = data[dataIdx];
+        ad.atlas_pool.recycle();
+        ad.vertex_pool.recycle();
 
         int changed = 0;
         // Ask libass to process the track at this specific millisecond frame marker
@@ -406,41 +602,38 @@ public:
             AtlasRegion out_uv;
             while (true) {
                 if (!atlas) {
-                    atlas = atlas_pool.alloc(wnd_w, wnd_h);
+                    atlas = ad.atlas_pool.alloc(device, wnd_w, wnd_h);
+                    regions.clear();
                 }
                 if (atlas->alloc_region(img->w, img->h, out_x, out_y, out_uv))
                     break;
                 if (atlas->vertices.empty()) {
-                    atlas->destroy(device);
-                    return; // too large img?
+                    delete atlas;
+                    return; // fatal: too large img?
                 } else {
-                    upload_vertices(pass, atlas);
-                    atlas_pool.in_use(atlas);
+                    upload_vertices(atlas);
+                    upload_atlas(atlas, regions);
+                    ad.atlas_pool.in_use(atlas);
                 }
                 atlas = nullptr;
             }
 
-            uint8_t* dst = (uint8_t*)SDL_MapGPUTransferBuffer(device, atlas->buf, false);
-            dst += atlas->offset;
+            uint8_t *map = (uint8_t *) atlas->up_memory.mapMemory(atlas->offset, img->w * img->h);
             const uint8_t* src = img->bitmap;
             for (int y = 0; y < img->h; ++y) {
-                SDL_memcpy(dst + (y * img->w), src + (y * img->stride), img->w);
+                SDL_memcpy(map + (y * img->w), src + (y * img->stride), img->w);
             }
-            SDL_UnmapGPUTransferBuffer(device, atlas->buf);
+            atlas->up_memory.unmapMemory();
 
-            SDL_GPUTextureTransferInfo transfer_info = {
-                .transfer_buffer = atlas->buf,
-                .offset = atlas->offset
-            };
-            SDL_GPUTextureRegion region = {
-                .texture = atlas->tex,
-                .x = out_x,
-                .y = out_y,
-                .w = static_cast<Uint32>(img->w),
-                .h = static_cast<Uint32>(img->h),
-                .d = 1
-            };
-            SDL_UploadToGPUTexture(pass, &transfer_info, &region, false);
+            regions.push_back({
+                .bufferOffset = atlas->offset,
+                .imageSubresource = {
+                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+                    .layerCount = 1,
+                },
+                .imageOffset = { (int32_t)out_x, (int32_t)out_y},
+                .imageExtent = { (uint32_t)img->w, (uint32_t)img->h, 1 }
+            });
             atlas->offset += img->w * img->h;
 
             uint32_t c = img->color;
@@ -457,24 +650,67 @@ public:
             });
         }
         if (atlas) {
-            upload_vertices(pass, atlas);
-            atlas_pool.in_use(atlas);
+            upload_vertices(atlas);
+            upload_atlas(atlas, regions);
+            ad.atlas_pool.in_use(atlas);
+        }
+
+        if (status_upload != Idle) {
+            ad.commandBuffer.end();
+            vk::SubmitInfo end_info = {
+                .commandBufferCount = 1,
+                .pCommandBuffers = &*ad.commandBuffer
+            };
+            queue.submit(end_info, ad.copyFence);
+            status_upload = Idle;
         }
     }
 
-    void draw(SDL_GPUCommandBuffer *cmd, SDL_GPURenderPass *pass) {
-        auto list = atlas_pool.get_in_use();
+    void draw(const vk::CommandBuffer commandBuffer) {
+        auto& ad = data[dataIdx];
+        auto list = ad.atlas_pool.get_in_use();
         if (list.empty())
             return;
 
-        SDL_BindGPUGraphicsPipeline(pass, pipeline);   // the one with blending enabled            
+        auto err = device.waitForFences(*ad.copyFence, vk::True, UINT64_MAX);
+        if (err != vk::Result::eSuccess)
+            return;
+
+        auto& set = sets[frameIdx];
 
         for (auto data : list) {
-            SDL_BindGPUVertexStorageBuffers(pass, 0, &data->vert_buf, 1);
-            SDL_GPUTextureSamplerBinding t_binding = { data->tex, sampler };
-            SDL_BindGPUFragmentSamplers(pass, 0, &t_binding, 1);
-            SDL_DrawGPUPrimitives(pass, data->vertices.size() * 6, 1, 0, 0);
+            //Update the Descriptor Set
+            vk::DescriptorImageInfo imageInfo{
+                .imageView = data->imageView,
+                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+            };
+            vk::DescriptorBufferInfo bufInfo{
+                .buffer = *data->vert_buf,
+                .range = (vk::DeviceSize)data->vert_size
+            };
+            vk::WriteDescriptorSet descriptorWrites[] = {
+                {
+                    .dstSet = set,
+                    .dstBinding = 0,
+                    .descriptorCount = 1,
+                    .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                    .pImageInfo = &imageInfo,
+                },
+                {
+                    .dstSet = set,
+                    .dstBinding = 1,
+                    .descriptorCount = 1,
+                    .descriptorType = vk::DescriptorType::eStorageBuffer,
+                    .pBufferInfo = &bufInfo,
+                },
+            };
+            device.updateDescriptorSets(descriptorWrites, nullptr);
+            commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+            commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0, *set, nullptr);
+            commandBuffer.draw(data->vertices.size() * 6, 1, 0, 0);
         }
+
+        frameIdx = (frameIdx + 1) % N_INFLIGHT;
     }
 
     void window_size_changed(Sint32 w, Sint32 h) {

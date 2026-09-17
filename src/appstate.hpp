@@ -13,8 +13,8 @@
 #include "ffmpeg.hpp"
 #include "subtitle.hpp"
 #include "ass.hpp"
-#include "sub_bitmap.hpp"
 #include "vulkan.hpp"
+//#include "sub_bitmap.hpp"
 #include "readerwriterqueue.h"
 
 const auto LARGE_INTERVAL = 777777.7;
@@ -494,17 +494,16 @@ public:
                         if (sub)
                             delete sub;
                     }, app_sub);
-//                    sub = new SubAss(gpu.get_device());
-                    sub = nullptr;
+                    sub = new SubAss(gpu.get_device());
                     app_sub = sub;
                 }
-//                sub->init(target_w, target_h, video.get_subtitle_ctx(), video.get_format_ctx(), window);
+                sub->init(target_w, target_h, video.get_subtitle_ctx(), video.get_format_ctx(), window);
             }
                 break;
 
             case SUBTITLE_BITMAP:
             {
-                SubBitmap *sub;
+/*                SubBitmap *sub;
                 auto pp = std::get_if<SubBitmap *>(&app_sub);
                 if (pp && *pp) {
                     sub = *pp;
@@ -513,11 +512,10 @@ public:
                         if (sub)
                             delete sub;
                     }, app_sub);
-//                    sub = new SubBitmap(gpu.get_device());
-                    sub = nullptr;
+                    sub = new SubBitmap(gpu.get_device());
                     app_sub = sub;
                 }
-                sub->init(video.get_subtitle_ctx(), window);
+                sub->init(video.get_subtitle_ctx(), window);*/
             }
                 break;
 
@@ -530,7 +528,7 @@ public:
         while (auto pp = video.sub_queue.peek()) {
             auto sub = *pp;
             if (sub_type == SUBTITLE_BITMAP) {
-                std::get<SubBitmap *>(app_sub)->add_sub(sub);
+//                std::get<SubBitmap *>(app_sub)->add_sub(sub);
                 video.sub_queue.pop();
                 continue;
             }
@@ -541,11 +539,11 @@ public:
                 switch (rect->type) {
                     case SUBTITLE_ASS:
                         if (rect->ass) {
-//                            std::get<SubAss *>(app_sub)->add_ass(rect->ass, static_cast<long long>(sub->frame_time * 1000), static_cast<long long>(sub->duration * 1000));
+                            std::get<SubAss *>(app_sub)->add_ass(rect->ass, static_cast<long long>(sub->frame_time * 1000), static_cast<long long>(sub->duration * 1000));
                         }
                         break;
                     case SUBTITLE_BITMAP:
-                        std::get<SubBitmap *>(app_sub)->add_sub(sub);
+//                        std::get<SubBitmap *>(app_sub)->add_sub(sub);
                         done = true;
                         break;
                 }

@@ -2,8 +2,7 @@
 
 #include <print>
 
-#define VULKAN_HPP_NO_STRUCT_CONSTRUCTORS
-#include <vulkan/vulkan_raii.hpp>
+#include "vk_util.hpp"
 #include <SDL3/SDL_vulkan.h>
 
 extern "C" {
@@ -44,8 +43,8 @@ private:
 	    vk::KHRSwapchainExtensionName,
 		vk::EXTExternalMemoryDmaBufExtensionName,
 		vk::EXTImageDrmFormatModifierExtensionName,
-//		vk::KHRExternalMemoryExtensionName,
-//		vk::KHRExternalMemoryFdExtensionName
+		vk::KHRExternalMemoryExtensionName,
+		vk::KHRExternalMemoryFdExtensionName,
 	};
 
     vk::raii::Context context;
@@ -56,12 +55,9 @@ private:
     vk::raii::SurfaceKHR surface = nullptr;
     vk::raii::PhysicalDevice physicalDevice = nullptr;
     vk::raii::Device device = nullptr;
-    uint32_t queueIndex     = ~0;
     vk::raii::Queue queue = nullptr;
 	vk::raii::SwapchainKHR           swapChain      = nullptr;
 	std::vector<vk::Image>           swapChainImages;
-	vk::SurfaceFormatKHR             swapChainSurfaceFormat;
-	vk::Extent2D                     swapChainExtent;
 	std::vector<vk::raii::ImageView> swapChainImageViews;
 	vk::raii::CommandPool                commandPool = nullptr;
 	std::vector<vk::raii::CommandBuffer> commandBuffers;
@@ -243,11 +239,12 @@ private:
 		}
 
 		// query for Vulkan 1.3 features
-		vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT, vk::PhysicalDeviceSamplerYcbcrConversionFeatures> featureChain = {
+		vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT, vk::PhysicalDeviceSamplerYcbcrConversionFeatures, vk::PhysicalDeviceDescriptorIndexingFeatures> featureChain = {
 		    {.features = {.samplerAnisotropy = true}},                   // vk::PhysicalDeviceFeatures2
 		    {.synchronization2 = true, .dynamicRendering = true},        // vk::PhysicalDeviceVulkan13Features
 		    {.extendedDynamicState = true},                               // vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT
-			{.samplerYcbcrConversion = true}
+			{.samplerYcbcrConversion = true},
+			{.shaderSampledImageArrayNonUniformIndexing = true, .runtimeDescriptorArray = true}
 		};
 
 		// create a Device
@@ -413,7 +410,7 @@ private:
 		createCommandBuffers();
         createSyncObjects();
 		
-        video.memProperties = physicalDevice.getMemoryProperties();
+        memProperties = physicalDevice.getMemoryProperties();
     }
 
     VkSurfaceFormatKHR SelectSurfaceFormat(const vk::raii::PhysicalDevice& physical_device, const vk::raii::SurfaceKHR& surface, const vk::Format* request_formats, int request_formats_count, vk::ColorSpaceKHR request_color_space)
@@ -541,10 +538,14 @@ public:
         if (!video.check_frame(frame_data.frame))
 		{
 			device.waitIdle();
-		    video.init(frame_data.frame, device, queueIndex, swapChainSurfaceFormat.format);
+		    video.init(frame_data.frame, device);
 			reset_scale();
 		}
         video.upload(std::move(frame_data), device, queue);
+		std::visit([&](auto&& sub){
+			if (sub)
+				sub->prepare_draw(frame_data.play_time);
+		}, sub);
     }
 
     bool check_next_frame(double play_time) {
@@ -557,10 +558,6 @@ public:
             return;
 
         commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *video.pipeline);
-		commandBuffer.setViewport(0, vk::Viewport(0.0f, static_cast<float>(swapChainExtent.height), static_cast<float>(swapChainExtent.width), -static_cast<float>(swapChainExtent.height), 0.0f, 1.0f));
-		commandBuffer.setScissor(0, vk::Rect2D(vk::Offset2D(0, 0), swapChainExtent));
-//		commandBuffer.bindVertexBuffers(0, *vertexBuffer, {0});
-//		commandBuffer.bindIndexBuffer(*indexBuffer, 0, vk::IndexTypeValue<decltype(indices)::value_type>::value);
 		commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, video.pipelineLayout, 0, *vf.set, nullptr);
         auto scale = base_scale * video_scale;
 		float w = 2.0f * scale * vf.frame_data.frame->width / wnd_w;
@@ -642,7 +639,13 @@ public:
 		    .pColorAttachments    = &attachmentInfo};
 		commandBuffer.beginRendering(renderingInfo);
 
+		commandBuffer.setViewport(0, vk::Viewport(0.0f, static_cast<float>(swapChainExtent.height), static_cast<float>(swapChainExtent.width), -static_cast<float>(swapChainExtent.height), 0.0f, 1.0f));
+		commandBuffer.setScissor(0, vk::Rect2D(vk::Offset2D(0, 0), swapChainExtent));
 		render_frame(commandBuffer);
+		std::visit([&](auto&& sub){
+			if (sub)
+				sub->draw(commandBuffer);
+		}, sub);
         ImGui_ImplVulkan_RenderDrawData(draw_data, commandBuffer);
 
 		commandBuffer.endRendering();
@@ -736,5 +739,9 @@ public:
 
 	void discard_pending() {
 		video.discard_pending();
+	}
+
+	const auto& get_device() {
+		return device;
 	}
 };

@@ -1,7 +1,6 @@
 #version 450
 
-// Descriptor Set 2 is required for SDL_GPU Fragment Samplers
-layout(set = 2, binding = 0) uniform sampler2D uTexture;
+layout(set = 0, binding = 0) uniform sampler2D uTexture;
 
 layout(location = 0) in vec2 inUV;
 layout(location = 1) in vec4 inColor;

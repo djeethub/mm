@@ -90,8 +90,8 @@ struct VkFrame {
     vk::raii::ImageView imageView = nullptr;
     vk::raii::DescriptorPool pool = nullptr;
     vk::raii::DescriptorSet set = nullptr;
-    vk::raii::DeviceMemory upload_buffer_memory = nullptr;
     vk::raii::Buffer upload_buffer = nullptr;
+    vk::raii::DeviceMemory upload_buffer_memory = nullptr;
     vk::raii::Fence copyFence = nullptr;
     vk::raii::CommandPool commandPool = nullptr;
     vk::raii::CommandBuffer commandBuffer = nullptr;
@@ -119,12 +119,12 @@ private:
     int bpp;
     vk::Format format;
 
-    void init_frames(const AVFrame *frame, const vk::raii::Device& device, uint32_t queueFamily) {
+    void init_frames(const AVFrame *frame, const vk::raii::Device& device) {
         for (auto& x : frames) {
             if (!*x.commandPool) {
                 vk::CommandPoolCreateInfo poolInfo = {
                     .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
-                    .queueFamilyIndex = queueFamily
+                    .queueFamilyIndex = queueIndex
                 };
                 x.commandPool = device.createCommandPool(poolInfo);
 
@@ -211,14 +211,17 @@ private:
                 vk::SamplerYcbcrConversionInfo viewConversionInfo = {
                     .conversion = ycbcrConversion
                 };
-                vk::ImageViewCreateInfo viewInfo{};
-                viewInfo.pNext = &viewConversionInfo; // <-- Crucial!
-                viewInfo.image = x.image;     // The VkImage containing your uploaded AVFrame data
-                viewInfo.viewType = vk::ImageViewType::e2D;
-                viewInfo.format = format;
-                viewInfo.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor; // Vulkan handles sub-planes internally
-                viewInfo.subresourceRange.levelCount = 1;
-                viewInfo.subresourceRange.layerCount = 1;
+                vk::ImageViewCreateInfo viewInfo{
+                    .pNext = &viewConversionInfo, // <-- Crucial!
+                    .image = x.image,     // The VkImage containing your uploaded AVFrame data
+                    .viewType = vk::ImageViewType::e2D,
+                    .format = format,
+                    .subresourceRange = {
+                        .aspectMask = vk::ImageAspectFlagBits::eColor, // Vulkan handles sub-planes internally
+                        .levelCount = 1,
+                        .layerCount = 1
+                    }
+                };
                 x.imageView = device.createImageView(viewInfo);
 
                 //Update the Descriptor Set
@@ -250,16 +253,6 @@ private:
         }
     }
 
-    uint32_t findMemoryType(uint32_t typeFilter, vk::MemoryPropertyFlags properties) {
-        for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
-            if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
-                return i;
-            }
-        }
-
-        throw std::runtime_error("failed to find suitable memory type!");
-    }
-
     static vk::raii::ShaderModule load_shader(const vk::raii::Device& device, ShaderType type) {
         vk::ShaderModuleCreateInfo shader_info{};
 
@@ -282,7 +275,6 @@ public:
 	int height;
     vk::raii::PipelineLayout pipelineLayout = nullptr;
     vk::raii::Pipeline pipeline = nullptr;
-    vk::PhysicalDeviceMemoryProperties memProperties;
 
     bool check_frame(const AVFrame *frame) {
         AVPixelFormat format;
@@ -298,7 +290,7 @@ public:
         return false;
     }
 
-    bool init(const AVFrame *frame, const vk::raii::Device& device, uint32_t queueFamily, vk::Format swap_format) {
+    bool init(const AVFrame *frame, const vk::raii::Device& device) {
         if (frame->hw_frames_ctx) {
             // Access the frame context structural layer
             AVHWFramesContext *hwfc = (AVHWFramesContext*)frame->hw_frames_ctx->data;
@@ -405,12 +397,12 @@ public:
         };
         layout = device.createDescriptorSetLayout(layoutInfo);
 
-        init_frames(frame, device, queueFamily);
-        createGraphicsPipeline(device, swap_format);
+        init_frames(frame, device);
+        createGraphicsPipeline(device);
         return true;
     }
 
-	void createGraphicsPipeline(const vk::raii::Device& device, vk::Format swap_format)
+	void createGraphicsPipeline(const vk::raii::Device& device)
 	{
         auto vert_shader = load_shader(device, VERT);
         auto frag_shader = load_shader(device, NV12_FRAG);
@@ -475,7 +467,7 @@ public:
                 .pDynamicState       = &dynamicState,
                 .layout              = pipelineLayout,
             },
-		    {.colorAttachmentCount = 1, .pColorAttachmentFormats = &swap_format}
+		    {.colorAttachmentCount = 1, .pColorAttachmentFormats = &swapChainSurfaceFormat.format}
         };
 
 		pipeline = vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
@@ -646,7 +638,7 @@ public:
         // Start command buffer
         {
             device.resetFences(*vf.copyFence);
-            vf.commandBuffer.reset();
+            vf.commandPool.reset();
             vk::CommandBufferBeginInfo begin_info{
                 .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit
             };
@@ -655,16 +647,10 @@ public:
 
         // Copy to Image:
         {
-            vk::BufferMemoryBarrier bufferBarrier = {
-                .srcAccessMask = vk::AccessFlagBits::eHostWrite,
-                .dstAccessMask = vk::AccessFlagBits::eTransferRead,
-                .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
-                .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
-                .buffer = *vf.upload_buffer,
-                .size = upload_size,
-            };
-            vk::ImageMemoryBarrier imageBarrier = {
-                .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+            vk::ImageMemoryBarrier2 imageBarrier = {
+                .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader | vk::PipelineStageFlagBits2::eHost,
+                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
                 .oldLayout = vf.status == VkFrame::New ? vk::ImageLayout::eUndefined : vk::ImageLayout::eShaderReadOnlyOptimal,
                 .newLayout = vk::ImageLayout::eTransferDstOptimal,
                 .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
@@ -676,7 +662,11 @@ public:
                     .layerCount = 1,
                 },
             };
-            vf.commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eFragmentShader | vk::PipelineStageFlagBits::eHost, vk::PipelineStageFlagBits::eTransfer, {}, nullptr, bufferBarrier, imageBarrier);
+            vk::DependencyInfo dep_info{
+                .imageMemoryBarrierCount = 1,
+                .pImageMemoryBarriers = &imageBarrier
+            };
+            vf.commandBuffer.pipelineBarrier2(dep_info);
 
             std::vector<vk::BufferImageCopy2> planeCopies(n_planes);
             if (n_planes > 1) {
@@ -710,8 +700,10 @@ public:
             vf.commandBuffer.copyBufferToImage2(copy_info);
 
             imageBarrier = {
-                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-                .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+                .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
                 .oldLayout = vk::ImageLayout::eTransferDstOptimal,
                 .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
                 .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
@@ -723,7 +715,11 @@ public:
                     .layerCount = 1,
                 },
             };
-            vf.commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eFragmentShader, {}, nullptr, nullptr, imageBarrier);
+            dep_info = {
+                .imageMemoryBarrierCount = 1,
+                .pImageMemoryBarriers = &imageBarrier
+            };
+            vf.commandBuffer.pipelineBarrier2(dep_info);
         }
 
         // End command buffer
