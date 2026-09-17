@@ -674,6 +674,10 @@ public:
             check_audio_frame();
             check_subtitle();
             auto play_time = get_play_time();
+            std::visit([&](auto&& sub){
+                if (sub)
+                    sub->check_next_frame(play_time);
+            }, app_sub);
             while (gpu.check_next_frame(play_time)) {
                 auto video_frame = fetch_video_frame(play_time);
                 if (video_frame.frame) {

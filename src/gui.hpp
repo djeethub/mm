@@ -105,8 +105,8 @@ class AppGui {
             }*/
 
             // 4. Fallback safeguard: If files are missing, default back to ProggyClean safely
-//            if (uiFont == nullptr)  uiFont  = io.Fonts->AddFontDefaultVector();
-//            if (osdFont == nullptr) osdFont = io.Fonts->AddFontDefaultVector();
+            if (uiFont == nullptr)  uiFont  = io.Fonts->AddFontDefaultVector();
+            if (osdFont == nullptr) osdFont = io.Fonts->AddFontDefaultVector();
 //            if (subtitleFont == nullptr) subtitleFont = io.Fonts->AddFontDefault();            
         }
 

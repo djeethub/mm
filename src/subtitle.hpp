@@ -2,18 +2,13 @@
 
 #include "vk_util.hpp"
 
-#define N_INFLIGHT 3
+#define N_INFLIGHT 4
 
 template <typename T>
 class GPUPool {
-protected:
+public:
     std::vector<T *> in_use_list;
     std::vector<T *> list;
-
-public:
-    auto get_in_use() {
-        return in_use_list;
-    }
 
     void recycle(T *buf) {
         buf->reset();
@@ -48,11 +43,9 @@ protected:
     vk::raii::Sampler sampler = nullptr;
     vk::raii::DescriptorSetLayout layout = nullptr;
     vk::raii::DescriptorPool pool = nullptr;
-    std::vector<vk::raii::DescriptorSet> sets;
     vk::raii::PipelineLayout pipelineLayout = nullptr;
     vk::raii::Pipeline pipeline = nullptr;
     vk::raii::CommandPool commandPool = nullptr;
-    vk::raii::Queue queue = nullptr;
 
     int wnd_w = 0;
     int wnd_h = 0;

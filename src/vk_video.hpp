@@ -113,7 +113,6 @@ private:
 
     vk::DeviceSize upload_size;
 
-    AVPixelFormat pix_fmt = AV_PIX_FMT_NONE;
     const AVPixFmtDescriptor *fmt_desc;
     int n_planes;
     int bpp;
@@ -271,6 +270,7 @@ private:
     }
 
 public:
+    AVPixelFormat pix_fmt = AV_PIX_FMT_NONE;
 	int width;
 	int height;
     vk::raii::PipelineLayout pipelineLayout = nullptr;
@@ -290,7 +290,7 @@ public:
         return false;
     }
 
-    bool init(const AVFrame *frame, const vk::raii::Device& device) {
+    bool init(const AVFrame *frame, const vk::raii::PhysicalDevice& physicalDevice, vk::raii::Device& device) {
         if (frame->hw_frames_ctx) {
             // Access the frame context structural layer
             AVHWFramesContext *hwfc = (AVHWFramesContext*)frame->hw_frames_ctx->data;
@@ -331,40 +331,48 @@ public:
                 throw std::runtime_error(msg.c_str());
         }
 
-        //Create the VkSamplerYcbcrConversion
-        vk::SamplerYcbcrConversionCreateInfo ycbcrInfo{
-            .format = format,
-            .components = { vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity },
-            .xChromaOffset = vk::ChromaLocation::eCositedEven,
-            .yChromaOffset = vk::ChromaLocation::eCositedEven,
-            .chromaFilter = vk::Filter::eLinear
-        };
-        switch (frame->color_range) {
-            case AVCOL_RANGE_JPEG:
-                ycbcrInfo.ycbcrRange = vk::SamplerYcbcrRange::eItuFull;
-                break;
-            default:
-                ycbcrInfo.ycbcrRange = vk::SamplerYcbcrRange::eItuNarrow;
+        vk::FormatProperties2 props = physicalDevice.getFormatProperties2(format);
+        auto features = props.formatProperties.optimalTilingFeatures;
+        bool canUseYcbcr = (features & vk::FormatFeatureFlagBits::eSampledImageYcbcrConversionLinearFilter) &&
+                        ((features & vk::FormatFeatureFlagBits::eMidpointChromaSamples) || 
+                            (features & vk::FormatFeatureFlagBits::eCositedChromaSamples));
+
+        if (canUseYcbcr) {
+            //Create the VkSamplerYcbcrConversion
+            vk::SamplerYcbcrConversionCreateInfo ycbcrInfo{
+                .format = format,
+                .components = { vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity },
+                .xChromaOffset = vk::ChromaLocation::eCositedEven,
+                .yChromaOffset = vk::ChromaLocation::eCositedEven,
+                .chromaFilter = vk::Filter::eLinear
+            };
+            switch (frame->color_range) {
+                case AVCOL_RANGE_JPEG:
+                    ycbcrInfo.ycbcrRange = vk::SamplerYcbcrRange::eItuFull;
+                    break;
+                default:
+                    ycbcrInfo.ycbcrRange = vk::SamplerYcbcrRange::eItuNarrow;
+            }
+            switch (frame->colorspace) {
+                case AVCOL_SPC_BT709:
+                    ycbcrInfo.ycbcrModel = vk::SamplerYcbcrModelConversion::eYcbcr709;
+                    break;
+                case AVCOL_SPC_BT2020_CL:
+                case AVCOL_SPC_BT2020_NCL:
+                    ycbcrInfo.ycbcrModel = vk::SamplerYcbcrModelConversion::eYcbcr2020;
+                    break;
+                case AVCOL_SPC_RGB:
+                    ycbcrInfo.ycbcrModel = vk::SamplerYcbcrModelConversion::eRgbIdentity;
+                    break;
+                case AVCOL_SPC_BT470BG:
+                case AVCOL_SPC_SMPTE170M:
+                default:
+                    ycbcrInfo.ycbcrModel = vk::SamplerYcbcrModelConversion::eYcbcr601;
+            }
+            ycbcrConversion = device.createSamplerYcbcrConversion(ycbcrInfo);
+        } else {
+            ycbcrConversion = nullptr;
         }
-        switch (frame->colorspace) {
-            case AVCOL_SPC_BT709:
-                ycbcrInfo.ycbcrModel = vk::SamplerYcbcrModelConversion::eYcbcr709;
-                break;
-            case AVCOL_SPC_BT2020_CL:
-            case AVCOL_SPC_BT2020_NCL:
-                ycbcrInfo.ycbcrModel = vk::SamplerYcbcrModelConversion::eYcbcr2020;
-                break;
-            case AVCOL_SPC_RGB:
-                ycbcrInfo.ycbcrModel = vk::SamplerYcbcrModelConversion::eRgbIdentity;
-                break;
-            case AVCOL_SPC_BT470BG:
-            case AVCOL_SPC_SMPTE170M:
-                ycbcrInfo.ycbcrModel = vk::SamplerYcbcrModelConversion::eYcbcr601;
-                break;
-            default:
-                ycbcrInfo.ycbcrModel = vk::SamplerYcbcrModelConversion::eYcbcrIdentity;
-        }
-        ycbcrConversion = device.createSamplerYcbcrConversion(ycbcrInfo);
 
         //Create the Sampler pointing to the Conversion
         vk::SamplerYcbcrConversionInfo samplerConversionInfo = {
@@ -586,9 +594,10 @@ public:
     void upload(AvFrameData frame_data, const vk::raii::Device& device, const vk::raii::Queue& queue) {
         auto next_idx = (frame_idx + 1) % N_FRAMES;
         auto& vf = frames[next_idx];
-        auto err = device.waitForFences(*vf.copyFence, vk::True, UINT64_MAX);
-        if (err != vk::Result::eSuccess)
+        auto err = device.waitForFences(*vf.copyFence, vk::True, 0);
+        if (err != vk::Result::eSuccess) {
             return;
+        }
 
         vf.frame_data = std::move(frame_data);
         AVFrame *frame = vf.frame_data.frame;
@@ -753,6 +762,7 @@ public:
             if (err == vk::Result::eSuccess) {
                 return true;
             }
+            return false;
         }
         return true;
     }

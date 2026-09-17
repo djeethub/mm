@@ -49,9 +49,7 @@ private:
 
     vk::raii::Context context;
     vk::raii::Instance instance = nullptr;
-#ifndef NDEBUG
     vk::raii::DebugUtilsMessengerEXT debugMessenger = nullptr;
-#endif
     vk::raii::SurfaceKHR surface = nullptr;
     vk::raii::PhysicalDevice physicalDevice = nullptr;
     vk::raii::Device device = nullptr;
@@ -239,12 +237,12 @@ private:
 		}
 
 		// query for Vulkan 1.3 features
-		vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT, vk::PhysicalDeviceSamplerYcbcrConversionFeatures, vk::PhysicalDeviceDescriptorIndexingFeatures> featureChain = {
+		vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT, vk::PhysicalDeviceSamplerYcbcrConversionFeatures> featureChain = {
 		    {.features = {.samplerAnisotropy = true}},                   // vk::PhysicalDeviceFeatures2
 		    {.synchronization2 = true, .dynamicRendering = true},        // vk::PhysicalDeviceVulkan13Features
 		    {.extendedDynamicState = true},                               // vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT
 			{.samplerYcbcrConversion = true},
-			{.shaderSampledImageArrayNonUniformIndexing = true, .runtimeDescriptorArray = true}
+//			{.shaderSampledImageArrayNonUniformIndexing = true, .runtimeDescriptorArray = true},, vk::PhysicalDeviceDescriptorIndexingFeatures
 		};
 
 		// create a Device
@@ -517,7 +515,7 @@ public:
     float video_scale = 1.0;
     float video_pan_x = 0.0;
     float video_pan_y = 0.0;
-	auto get_pix_fmt() { return AV_PIX_FMT_NONE; }
+	auto get_pix_fmt() { return video.pix_fmt; }
 
     bool init(SDL_Window *window) {
         SDL_GetWindowSizeInPixels(window, &wnd_w, &wnd_h);
@@ -538,13 +536,13 @@ public:
         if (!video.check_frame(frame_data.frame))
 		{
 			device.waitIdle();
-		    video.init(frame_data.frame, device);
+		    video.init(frame_data.frame, physicalDevice, device);
 			reset_scale();
 		}
         video.upload(std::move(frame_data), device, queue);
 		std::visit([&](auto&& sub){
 			if (sub)
-				sub->prepare_draw(frame_data.play_time);
+				sub->prepare_draw(queue, frame_data.play_time);
 		}, sub);
     }
 
