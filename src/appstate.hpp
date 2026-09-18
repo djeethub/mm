@@ -359,12 +359,13 @@ public:
         return line; // Fallback if string is unexpected or malformed
     }
 
-    bool seek(double ts) {
+    bool seek(double ts, bool reset = true) {
         {
             std::lock_guard lock(video.mutex);
             if (video.seek(ts))
             {
-                clear_frame_buffers();
+                if (reset)
+                    clear_frame_buffers();
                 seek_time = ts;
                 video.seek_time = ts;
                 video.is_seeking = true;
@@ -686,7 +687,7 @@ public:
                     if (video.is_eof.load(std::memory_order_relaxed)) {
                         auto duration = video.get_duration();
                         if (duration <= play_time) {
-                            if (is_loop && duration > 0.5 && seek(video.get_start_time())) {
+                            if (is_loop && duration > 0.5 && seek(video.get_start_time(), false)) {
                             } else
                                 set_video_play(false);
                         }

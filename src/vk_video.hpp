@@ -88,16 +88,19 @@ struct VkFrame {
     vk::raii::Image image = nullptr;
     vk::raii::DeviceMemory memory = nullptr;
     vk::raii::ImageView imageView = nullptr;
-    vk::raii::DescriptorPool pool = nullptr;
-    vk::raii::DescriptorSet set = nullptr;
     vk::raii::Buffer upload_buffer = nullptr;
     vk::raii::DeviceMemory upload_buffer_memory = nullptr;
     vk::raii::Fence copyFence = nullptr;
-    vk::raii::CommandPool commandPool = nullptr;
+    vk::raii::DescriptorSet set = nullptr;
     vk::raii::CommandBuffer commandBuffer = nullptr;
 
     AvFrameData frame_data;
     Status status = None;
+
+    void reset() {
+        commandBuffer.reset();
+        set.clear();
+    }
 };
 
 class VkVideo {
@@ -105,143 +108,103 @@ private:
     inline static const int N_FRAMES = 4;
 
     vk::raii::SamplerYcbcrConversion ycbcrConversion = nullptr;
-    vk::raii::DescriptorSetLayout layout = nullptr;
     vk::raii::Sampler sampler = nullptr;
+    vk::raii::DescriptorSetLayout layout = nullptr;
+    vk::raii::DescriptorPool pool = nullptr;
+    vk::raii::CommandPool commandPool = nullptr;
 
     VkFrame frames[N_FRAMES];
     int frame_idx = 0;
 
+    vk::Format format;
     vk::DeviceSize upload_size;
-
     const AVPixFmtDescriptor *fmt_desc;
     int n_planes;
     int bpp;
-    vk::Format format;
+    bool native = true;
+    SwsContext *sws_ctx = nullptr;
 
-    void init_frames(const AVFrame *frame, const vk::raii::Device& device) {
-        for (auto& x : frames) {
-            if (!*x.commandPool) {
-                vk::CommandPoolCreateInfo poolInfo = {
-                    .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
-                    .queueFamilyIndex = queueIndex
-                };
-                x.commandPool = device.createCommandPool(poolInfo);
+    void init_frame(int idx, const AVFrame *frame, const vk::raii::Device& device) {
+        auto& x = frames[idx];
 
-                vk::CommandBufferAllocateInfo allocInfo = {
-                    .commandPool = x.commandPool,
-                    .level = vk::CommandBufferLevel::ePrimary,
-                    .commandBufferCount = 1
-                };
-                x.commandBuffer = std::move(device.allocateCommandBuffers(allocInfo)[0]);
+        if (frame->hw_frames_ctx) {
+        } else {
+            vk::ImageCreateInfo info{
+                .imageType = vk::ImageType::e2D,
+                .format = format,
+                .extent = { .width = (uint32_t) frame->width, .height = (uint32_t) frame->height, .depth = 1 },
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = vk::SampleCountFlagBits::e1,
+                .tiling = vk::ImageTiling::eOptimal,
+                .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
+                .sharingMode = vk::SharingMode::eExclusive,
+                .initialLayout = vk::ImageLayout::eUndefined,
+            };
+            x.image = device.createImage(info);
+            auto req = x.image.getMemoryRequirements();
+            vk::MemoryAllocateInfo mem_alloc_info{
+                .allocationSize = req.size,
+                .memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal)
+            };
+            x.memory = device.allocateMemory(mem_alloc_info);
+            x.image.bindMemory(x.memory, 0);
 
-                vk::FenceCreateInfo fence_info = {
-                    .flags = vk::FenceCreateFlagBits::eSignaled,
+            // Create the Upload Buffer:
+            upload_size = get_upload_size();
+            {
+                vk::BufferCreateInfo buffer_info = {
+                    .size = upload_size,
+                    .usage = vk::BufferUsageFlagBits::eTransferSrc,
+                    .sharingMode = vk::SharingMode::eExclusive
                 };
-                x.copyFence = device.createFence(fence_info);
-
-                vk::DescriptorPoolSize pool_sizes[] =
-                {
-                    { vk::DescriptorType::eCombinedImageSampler, 3 },
+                x.upload_buffer = device.createBuffer(buffer_info);
+                auto req = x.upload_buffer.getMemoryRequirements();
+                vk::MemoryAllocateInfo alloc_info = {
+                    .allocationSize = req.size,
+                    .memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)
                 };
-                vk::DescriptorPoolCreateInfo pool_info{
-                    .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
-                    .maxSets = 1,
-                    .poolSizeCount = (uint32_t)IM_COUNTOF(pool_sizes),
-                    .pPoolSizes = pool_sizes
-                };
-                x.pool = device.createDescriptorPool(pool_info);
-
-                // Allocate a descriptor set from the pool
-                vk::DescriptorSetAllocateInfo alloc_info{
-                    .descriptorPool = x.pool, // The pool we just created
-                    .descriptorSetCount = 1,
-                    .pSetLayouts = &*layout // Your predefined VkDescriptorSetLayout
-                };
-                x.set = std::move(device.allocateDescriptorSets(alloc_info)[0]);
-            } else {
-                vk::FenceCreateInfo fence_info = {
-                    .flags = vk::FenceCreateFlagBits::eSignaled,
-                };
-                x.copyFence = device.createFence(fence_info);
+                x.upload_buffer_memory = device.allocateMemory(alloc_info);
+                x.upload_buffer.bindMemory(x.upload_buffer_memory, 0);
             }
 
-            // Create the Image
-            if (frame->hw_frames_ctx) {
+            vk::ImageViewCreateInfo viewInfo{
+                .image = x.image,     // The VkImage containing your uploaded AVFrame data
+                .viewType = vk::ImageViewType::e2D,
+                .format = format,
+                .subresourceRange = {
+                    .aspectMask = vk::ImageAspectFlagBits::eColor, // Vulkan handles sub-planes internally
+                    .levelCount = 1,
+                    .layerCount = 1
+                },
+            };
+            vk::DescriptorImageInfo imageInfo{
+                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+            };
+            vk::SamplerYcbcrConversionInfo viewConversionInfo{
+            };
+            if (*ycbcrConversion) {
+                viewConversionInfo.conversion = ycbcrConversion;
+                viewInfo.pNext = &viewConversionInfo; // <-- Crucial!
             } else {
-                vk::ImageCreateInfo info = {
-                    .imageType = vk::ImageType::e2D,
-                    .format = format,
-                    .extent = { .width = (uint32_t) frame->width, .height = (uint32_t) frame->height, .depth = 1 },
-                    .mipLevels = 1,
-                    .arrayLayers = 1,
-                    .samples = vk::SampleCountFlagBits::e1,
-                    .tiling = vk::ImageTiling::eOptimal,
-                    .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
-                    .sharingMode = vk::SharingMode::eExclusive,
-                    .initialLayout = vk::ImageLayout::eUndefined,
-                };
-                x.image = device.createImage(info);
-                auto req = x.image.getMemoryRequirements();
-                vk::MemoryAllocateInfo mem_alloc_info = {};
-                mem_alloc_info.allocationSize = req.size;
-                mem_alloc_info.memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal);
-                x.memory = device.allocateMemory(mem_alloc_info);
-                x.image.bindMemory(x.memory, 0);
-
-                // Create the Upload Buffer:
-                upload_size = get_upload_size();
-                {
-                    vk::BufferCreateInfo buffer_info = {
-                        .size = upload_size,
-                        .usage = vk::BufferUsageFlagBits::eTransferSrc,
-                        .sharingMode = vk::SharingMode::eExclusive
-                    };
-                    x.upload_buffer = device.createBuffer(buffer_info);
-                    auto req = x.upload_buffer.getMemoryRequirements();
-                    vk::MemoryAllocateInfo alloc_info = {
-                        .allocationSize = req.size,
-                        .memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)
-                    };
-                    x.upload_buffer_memory = device.allocateMemory(alloc_info);
-                    x.upload_buffer.bindMemory(x.upload_buffer_memory, 0);
-                }
-
-                // Create the VkImageView with Conversion Info
-                vk::SamplerYcbcrConversionInfo viewConversionInfo = {
-                    .conversion = ycbcrConversion
-                };
-                vk::ImageViewCreateInfo viewInfo{
-                    .pNext = &viewConversionInfo, // <-- Crucial!
-                    .image = x.image,     // The VkImage containing your uploaded AVFrame data
-                    .viewType = vk::ImageViewType::e2D,
-                    .format = format,
-                    .subresourceRange = {
-                        .aspectMask = vk::ImageAspectFlagBits::eColor, // Vulkan handles sub-planes internally
-                        .levelCount = 1,
-                        .layerCount = 1
-                    }
-                };
-                x.imageView = device.createImageView(viewInfo);
-
-                //Update the Descriptor Set
-                vk::DescriptorImageInfo imageInfo{
-                    .imageView = x.imageView,
-                    .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
-                };
-                vk::WriteDescriptorSet descriptorWrites[] = {
-                    {
-                        .dstSet = x.set,
-                        .dstBinding = 0,
-                        .descriptorCount = 1,
-                        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-                        .pImageInfo = &imageInfo,
-                    },
-                };
-                device.updateDescriptorSets(descriptorWrites, nullptr);
+                imageInfo.sampler = sampler;
             }
+            x.imageView = device.createImageView(viewInfo);
+            imageInfo.imageView = x.imageView;
 
-            x.status = VkFrame::New;
+            vk::WriteDescriptorSet descriptorWrites[] = {
+                {
+                    .dstSet = x.set,
+                    .dstBinding = 0,
+                    .descriptorCount = 1,
+                    .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                    .pImageInfo = &imageInfo,
+                },
+            };
+            device.updateDescriptorSets(descriptorWrites, nullptr);
         }
+
+        x.status = VkFrame::New;
     }
 
     int get_upload_size() {
@@ -264,6 +227,14 @@ private:
 			shader_info.pCode = (uint32_t *) nv12_frag;
 			shader_info.codeSize = nv12_frag_len;
 			break;
+        case RGB_FRAG:
+			shader_info.pCode = (uint32_t *) rgb_frag;
+			shader_info.codeSize = rgb_frag_len;
+            break;
+        case YUYV_FRAG:
+			shader_info.pCode = (uint32_t *) yuyv_frag;
+			shader_info.codeSize = yuyv_frag_len;
+            break;
         }
 
         return device.createShaderModule(shader_info);
@@ -275,6 +246,42 @@ public:
 	int height;
     vk::raii::PipelineLayout pipelineLayout = nullptr;
     vk::raii::Pipeline pipeline = nullptr;
+
+    void init_once(const vk::raii::Device& device) {
+        vk::CommandPoolCreateInfo poolInfo = {
+            .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+            .queueFamilyIndex = queueIndex
+        };
+        commandPool = device.createCommandPool(poolInfo);
+
+        vk::CommandBufferAllocateInfo allocInfo = {
+            .commandPool = commandPool,
+            .level = vk::CommandBufferLevel::ePrimary,
+            .commandBufferCount = N_FRAMES
+        };
+        auto commandBuffers = device.allocateCommandBuffers(allocInfo);
+
+        vk::DescriptorPoolSize pool_sizes[] =
+        {
+            { vk::DescriptorType::eCombinedImageSampler, N_FRAMES * 4 },
+        };
+        vk::DescriptorPoolCreateInfo pool_info{
+            .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+            .maxSets = N_FRAMES,
+            .poolSizeCount = (uint32_t)IM_COUNTOF(pool_sizes),
+            .pPoolSizes = pool_sizes
+        };
+        pool = device.createDescriptorPool(pool_info);
+
+        vk::FenceCreateInfo fence_info = {
+            .flags = vk::FenceCreateFlagBits::eSignaled,
+        };
+
+        for (auto i = 0; i < N_FRAMES; i++) {
+            frames[i].commandBuffer = std::move(commandBuffers[i]);
+            frames[i].copyFence = device.createFence(fence_info);
+        }
+    }
 
     bool check_frame(const AVFrame *frame) {
         AVPixelFormat format;
@@ -295,8 +302,9 @@ public:
             // Access the frame context structural layer
             AVHWFramesContext *hwfc = (AVHWFramesContext*)frame->hw_frames_ctx->data;
             pix_fmt = hwfc->sw_format;
-        } else
+        } else {
             pix_fmt = (AVPixelFormat) frame->format;
+        }
         width = frame->width;
         height = frame->height;
         fmt_desc = av_pix_fmt_desc_get(pix_fmt);
@@ -307,16 +315,14 @@ public:
 				bpp += fmt_desc->comp[i].depth;
 			}
 			bpp /= 8;
-			if (bpp == 3)
-				bpp++;
+//			if (bpp == 3)
+//				bpp++;
 		} else {
 			bpp = (fmt_desc->comp[0].depth + 7) / 8;
 		}
 
+        native = true;
         switch (pix_fmt) {
-            case AV_PIX_FMT_YUV420P:
-                format = vk::Format::eG8B8R83Plane420Unorm;
-                break;
             case AV_PIX_FMT_NV12:
                 format = vk::Format::eG8B8R82Plane420Unorm;
                 break;
@@ -326,9 +332,69 @@ public:
             case AV_PIX_FMT_YUV420P10:
                 format = vk::Format::eG10X6B10X6R10X63Plane420Unorm3Pack16;
                 break;
+            case AV_PIX_FMT_RGB24:
+                format = vk::Format::eR8G8B8Unorm;
+                break;
+            case AV_PIX_FMT_BGR24:
+                format = vk::Format::eB8G8R8Unorm;
+                break;
+            case AV_PIX_FMT_YUV420P:
+            case AV_PIX_FMT_YUVJ420P:
+                format = vk::Format::eG8B8R83Plane420Unorm;
+                break;
+            case AV_PIX_FMT_YUV422P:
+            case AV_PIX_FMT_YUVJ422P:
+                format = vk::Format::eG8B8R83Plane422Unorm;
+                break;
+            case AV_PIX_FMT_YUV444P:
+            case AV_PIX_FMT_YUVJ444P:
+                format = vk::Format::eG8B8R83Plane444Unorm;
+                break;
+            case AV_PIX_FMT_YUYV422:
+                format = vk::Format::eG8B8G8R8422Unorm;
+                break;
+            case AV_PIX_FMT_GRAY8:
+                format = vk::Format::eA8Unorm;
+                break;
+            case AV_PIX_FMT_RGBA:
+                format = vk::Format::eR8G8B8A8Unorm;
+                break;
+            case AV_PIX_FMT_BGRA:
+                format = vk::Format::eB8G8R8A8Unorm;
+                break;
+            case AV_PIX_FMT_YUVA420P:
+                native = false;
+                break;
             default:
                 auto msg = std::format("Unsupported pix fmt: {}", av_get_pix_fmt_name(pix_fmt));
                 throw std::runtime_error(msg.c_str());
+        }
+
+        if (native) {
+            try {
+                vk::PhysicalDeviceImageFormatInfo2 format_info{
+                    .format = format,
+                    .type = vk::ImageType::e2D,
+                    .tiling = vk::ImageTiling::eOptimal,
+                    .usage = vk::ImageUsageFlagBits::eSampled,
+    //                .flags = vk::ImageCreateFlagBits::eMutableFormat,
+                };
+                auto imageProps = physicalDevice.getImageFormatProperties2(format_info);
+            } catch (const vk::FormatNotSupportedError& err) {
+                native = false;
+            }
+        }
+        if (!native) {
+            if (!frame->hw_frames_ctx) {
+                setup_sws_context(pix_fmt, AV_PIX_FMT_RGBA);
+            }
+            format = vk::Format::eR8G8B8A8Unorm;
+            n_planes = 1;
+            bpp = 4;
+        }
+
+        for (auto& x : frames) {
+            x.reset();
         }
 
         vk::FormatProperties2 props = physicalDevice.getFormatProperties2(format);
@@ -337,6 +403,24 @@ public:
                         ((features & vk::FormatFeatureFlagBits::eMidpointChromaSamples) || 
                             (features & vk::FormatFeatureFlagBits::eCositedChromaSamples));
 
+        vk::SamplerCreateInfo samplerInfo{
+            .magFilter = vk::Filter::eLinear,
+            .minFilter = vk::Filter::eLinear,
+        // Address modes must be CLAMP_TO_EDGE for YUV samplers
+            .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+            .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+            .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+        };
+        vk::SamplerYcbcrConversionInfo samplerConversionInfo = {
+        };
+        vk::DescriptorSetLayoutBinding bindings[] = {
+            {
+                .binding = 0,
+                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                .descriptorCount = 1,
+                .stageFlags = vk::ShaderStageFlagBits::eFragment,
+            },
+        };
         if (canUseYcbcr) {
             //Create the VkSamplerYcbcrConversion
             vk::SamplerYcbcrConversionCreateInfo ycbcrInfo{
@@ -370,42 +454,36 @@ public:
                     ycbcrInfo.ycbcrModel = vk::SamplerYcbcrModelConversion::eYcbcr601;
             }
             ycbcrConversion = device.createSamplerYcbcrConversion(ycbcrInfo);
+            //Create the Sampler pointing to the Conversion
+            samplerConversionInfo.conversion = ycbcrConversion;
+            samplerInfo.pNext = &samplerConversionInfo;
+            bindings[0].pImmutableSamplers = &*sampler; // <-- Baked directly into the layout binding!
         } else {
             ycbcrConversion = nullptr;
         }
 
-        //Create the Sampler pointing to the Conversion
-        vk::SamplerYcbcrConversionInfo samplerConversionInfo = {
-            .conversion = ycbcrConversion
-        };
-        vk::SamplerCreateInfo samplerInfo{
-            .pNext = &samplerConversionInfo, // <-- Bind the conversion rules here
-            .magFilter = vk::Filter::eLinear,
-            .minFilter = vk::Filter::eLinear,
-        // Address modes must be CLAMP_TO_EDGE for YUV samplers
-            .addressModeU = vk::SamplerAddressMode::eClampToEdge,
-            .addressModeV = vk::SamplerAddressMode::eClampToEdge,
-            .addressModeW = vk::SamplerAddressMode::eClampToEdge,
-        };
         sampler = device.createSampler(samplerInfo);
 
-        // Define the Descriptor Set Layout with an Immutable Sampler
-        vk::DescriptorSetLayoutBinding bindings[] = {
-            {
-                .binding = 0,
-                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-                .descriptorCount = 1,
-                .stageFlags = vk::ShaderStageFlagBits::eFragment,
-                .pImmutableSamplers = &*sampler // <-- Baked directly into the layout binding!
-            },
-        };
         vk::DescriptorSetLayoutCreateInfo layoutInfo{
             .bindingCount = 1,
             .pBindings = bindings,
         };
         layout = device.createDescriptorSetLayout(layoutInfo);
 
-        init_frames(frame, device);
+        std::vector<vk::DescriptorSetLayout> layouts(N_FRAMES, layout);
+        // Allocate a descriptor set from the pool
+        vk::DescriptorSetAllocateInfo alloc_info{
+            .descriptorPool = pool, // The pool we just created
+            .descriptorSetCount = N_FRAMES,
+            .pSetLayouts = layouts.data() // Your predefined VkDescriptorSetLayout
+        };
+        auto sets = device.allocateDescriptorSets(alloc_info);
+
+        for (auto i = 0; i < N_FRAMES; i++) {
+            frames[i].set = std::move(sets[i]);
+            init_frame(i, frame, device);
+        }
+
         createGraphicsPipeline(device);
         return true;
     }
@@ -413,7 +491,18 @@ public:
 	void createGraphicsPipeline(const vk::raii::Device& device)
 	{
         auto vert_shader = load_shader(device, VERT);
-        auto frag_shader = load_shader(device, NV12_FRAG);
+        ShaderType shader_type;
+        switch (format) {
+        case vk::Format::eR8G8B8A8Unorm:
+            if (pix_fmt == AV_PIX_FMT_YUYV422)
+                shader_type = YUYV_FRAG;
+            else
+                shader_type = RGB_FRAG;
+            break;
+        default:
+            shader_type = NV12_FRAG;
+        }
+        auto frag_shader = load_shader(device, shader_type);
 
 		vk::PipelineShaderStageCreateInfo vertShaderStageInfo{.stage = vk::ShaderStageFlagBits::eVertex, .module = vert_shader, .pName = "main"};
 		vk::PipelineShaderStageCreateInfo fragShaderStageInfo{.stage = vk::ShaderStageFlagBits::eFragment, .module = frag_shader, .pName = "main"};
@@ -481,6 +570,10 @@ public:
 		pipeline = vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
 	}
 
+    void shutdown() {
+		sws_free_context(&sws_ctx);
+    }
+
     void upmap(VkFrame& vf, const vk::raii::Device& device, const vk::raii::Queue& queue) {
         auto frame = vf.frame_data.frame;
 
@@ -522,12 +615,18 @@ public:
             .pNext = &modifier_info,
             .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT
         };
+        uint32_t width = frame->width;
+        uint32_t height = frame->height;
+        if (!native) {
+            width >>= fmt_desc->log2_chroma_w;
+            width >>= fmt_desc->log2_chroma_h;
+        }
         // 3. Create the Image
         vk::ImageCreateInfo img_info = {
             .pNext = &external_memory_img_info,
             .imageType = vk::ImageType::e2D,
             .format = format, // NV12 matching Vulkan layout
-            .extent = { .width = (uint32_t) frame->width, .height = (uint32_t) frame->height, .depth = 1 },
+            .extent = { .width = (uint32_t) width, .height = (uint32_t) height, .depth = 1 },
             .mipLevels = 1,
             .arrayLayers = 1,
             .samples = vk::SampleCountFlagBits::e1,
@@ -558,25 +657,30 @@ public:
         vf.memory = device.allocateMemory(alloc_info);
         vf.image.bindMemory(vf.memory, 0);
 
-        // Create the VkImageView with Conversion Info
-        vk::SamplerYcbcrConversionInfo viewConversionInfo = {
-            .conversion = ycbcrConversion
+        vk::ImageViewCreateInfo viewInfo{
+            .image = vf.image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = format,
+            .subresourceRange = {
+                .aspectMask = vk::ImageAspectFlagBits::eColor, // Vulkan handles sub-planes internally
+                .levelCount = 1,
+                .layerCount = 1,
+            }
         };
-        vk::ImageViewCreateInfo viewInfo{};
-        viewInfo.pNext = &viewConversionInfo; // <-- Crucial!
-        viewInfo.image = vf.image;     // The VkImage containing your uploaded AVFrame data
-        viewInfo.viewType = vk::ImageViewType::e2D;
-        viewInfo.format = format;
-        viewInfo.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor; // Vulkan handles sub-planes internally
-        viewInfo.subresourceRange.levelCount = 1;
-        viewInfo.subresourceRange.layerCount = 1;
-        vf.imageView = device.createImageView(viewInfo);
-
-        //Update the Descriptor Set
         vk::DescriptorImageInfo imageInfo{
-            .imageView = vf.imageView,
             .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
         };
+        vk::SamplerYcbcrConversionInfo viewConversionInfo = {
+        };
+        if (*ycbcrConversion) {
+            viewConversionInfo.conversion = ycbcrConversion;
+            viewInfo.pNext = &viewConversionInfo; // <-- Crucial!
+        } else {
+            imageInfo.sampler = sampler;
+        }
+        vf.imageView = device.createImageView(viewInfo);
+        imageInfo.imageView = vf.imageView;
+
         vk::WriteDescriptorSet descriptorWrites[] = {
             {
                 .dstSet = vf.set,
@@ -609,30 +713,36 @@ public:
         int offset[4]{};
         // Upload to Buffer:
         uint8_t *map = (uint8_t *) vf.upload_buffer_memory.mapMemory(0, upload_size);
-        uint8_t *src = frame->data[0];
-        auto map_save = map;
-        auto bytes_per_line = width * bpp;
-        for (int y = 0; y < height; y++) {
-            memcpy(map, src, bytes_per_line);
-            map += bytes_per_line;
-            src += frame->linesize[0];
-        }
-        if (n_planes > 1) {
-            bytes_per_line = (width >> fmt_desc->log2_chroma_w) * bpp * (n_planes == 2 ? 2 : 1);
-            auto new_height = height >> fmt_desc->log2_chroma_h;
-            for (auto idx = 1; idx < n_planes && idx < 3; idx++) {
-                src = frame->data[idx];
-                offset[idx] = map - map_save;
-                for (int y = 0; y < new_height; y++) {
-                    memcpy(map, src, bytes_per_line);
-                    map += bytes_per_line;
-                    src += frame->linesize[idx];
-                }
+        if (!native) {
+			uint8_t* dst_data[4] = { static_cast<uint8_t *>(map), NULL, NULL, NULL };
+			int dst_linesize[4]  = { static_cast<int>(width) * 4, 0, 0, 0 };
+			sws_scale(sws_ctx, &frame->data[0], &frame->linesize[0], 0, height, dst_data, dst_linesize);
+        } else {
+            uint8_t *src = frame->data[0];
+            auto map_save = map;
+            auto bytes_per_line = width * bpp;
+            for (int y = 0; y < height; y++) {
+                memcpy(map, src, bytes_per_line);
+                map += bytes_per_line;
+                src += frame->linesize[0];
             }
+            if (n_planes > 1) {
+                bytes_per_line = (width >> fmt_desc->log2_chroma_w) * bpp * (n_planes == 2 ? 2 : 1);
+                auto new_height = height >> fmt_desc->log2_chroma_h;
+                for (auto idx = 1; idx < n_planes && idx < 3; idx++) {
+                    src = frame->data[idx];
+                    offset[idx] = map - map_save;
+                    for (int y = 0; y < new_height; y++) {
+                        memcpy(map, src, bytes_per_line);
+                        map += bytes_per_line;
+                        src += frame->linesize[idx];
+                    }
+                }
 
-            if (n_planes > 3) {
-                assert(false);
-//                    bytes_per_line = width * bpp;
+                if (n_planes > 3) {
+                    assert(false);
+    //                    bytes_per_line = width * bpp;
+                }
             }
         }
 
@@ -647,7 +757,7 @@ public:
         // Start command buffer
         {
             device.resetFences(*vf.copyFence);
-            vf.commandPool.reset();
+            vf.commandBuffer.reset();
             vk::CommandBufferBeginInfo begin_info{
                 .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit
             };
@@ -772,10 +882,34 @@ public:
     }
 
     void discard_pending() {
+        frames[frame_idx].status = VkFrame::Discard;
         auto next_idx = (frame_idx + 1) % N_FRAMES;
         auto& vf = frames[next_idx];
         if (vf.status == VkFrame::Upload) {
             vf.status = VkFrame::Discard;
         }
     }
+
+  	bool setup_sws_context(AVPixelFormat src_fmt, AVPixelFormat dst_fmt) {
+		sws_free_context(&sws_ctx);
+		sws_ctx = sws_getContext(
+			width, height, src_fmt,       // Source video specs
+			width, height, dst_fmt,        // Destination specs (GPU friendly)
+			SWS_BILINEAR,                          // Fast filter (since size is identical)
+			NULL, NULL, NULL
+		);
+/*        const int *inv_table, *table;
+        int srcRange, dstRange, brightness, contrast, saturation;
+
+        // 1 = Full range (0-255), 0 = Limited range (16-235)
+        srcRange = 0; // Set based on your input metadata
+        dstRange = 1; // RGBA is almost always Full Range (1)
+
+        inv_table = sws_getCoefficients(SWS_CS_ITU709); // Or SWS_CS_ITU601
+        table     = sws_getCoefficients(SWS_CS_DEFAULT);
+
+        sws_setColorspaceDetails(sws_ctx, inv_table, srcRange, table, dstRange, 0, 1 << 16, 1 << 16);*/
+
+		return sws_ctx != nullptr;
+	}
 };

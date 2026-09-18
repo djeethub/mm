@@ -30,8 +30,8 @@ struct ImageData {
         this->h = h;
         if (alloc_w >= w && alloc_h >= h)
             return;
-        alloc_w = w + 32;
-        alloc_h = h + 32;
+        alloc_w = std::max(w, alloc_w) + 32;
+        alloc_h = std::max(h, alloc_h) + 32;
 
         vk::ImageCreateInfo info = {
             .imageType = vk::ImageType::e2D,

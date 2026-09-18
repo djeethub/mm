@@ -71,7 +71,6 @@ private:
 	int wnd_w = 0;
 	int wnd_h = 0;
 	float base_scale = 0.0;
-	SwsContext *sws_ctx = nullptr;
 
 	std::vector<const char *> getRequiredInstanceExtensions()
 	{
@@ -520,6 +519,8 @@ public:
     bool init(SDL_Window *window) {
         SDL_GetWindowSizeInPixels(window, &wnd_w, &wnd_h);
         SetupVulkan(window);
+		
+		video.init_once(device);
 
         return true;
     }

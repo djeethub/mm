@@ -2,28 +2,24 @@
 
 #include "utils.glsl"
 
-// Texture bindings
-layout(set = 2, binding = 0) uniform sampler2D u_tex_y;
+layout(push_constant, std430) uniform pc {
+    layout(offset = 16) vec2  u_tex_size;
+};
 
-// Uniforms
-layout(std140, set = 3, binding = 0) uniform Uniforms {
-    vec2  tex_size;        // full resolution (Y plane)
-    int   color_range;   // 2 = jpeg, 1 = mpeg
-    int   colorspace;    // 2 = BT.601, 1 = BT.709, 9,10 = BT.2020
-} uf;
+layout(set = 0, binding = 0) uniform sampler2D u_tex_y;
 
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 o_color;
 
 void main() {
-    float col = v_uv.x * uf.tex_size.x;
+    float col = v_uv.x * u_tex_size.x;
     bool even  = mod(col, 2.0) < 1.0;
 
     vec3 yuv;
     // Calculate how many source texels fit inside ONE screen pixel
     vec2 duv_dx = dFdx(v_uv);
     vec2 duv_dy = dFdy(v_uv);
-    vec2 texelsPerPixel = vec2(length(duv_dx), length(duv_dy)) * uf.tex_size;
+    vec2 texelsPerPixel = vec2(length(duv_dx), length(duv_dy)) * u_tex_size;
 
     // --- DOWNSCALING PATH (Large image shrunk into small window) ---
     if (texelsPerPixel.x > 1.2 || texelsPerPixel.y > 1.2) {
@@ -47,6 +43,6 @@ void main() {
         yuv = vec3(even ? texture(u_tex_y, v_uv).r : texture(u_tex_y, v_uv).b, texture(u_tex_y, v_uv).g, texture(u_tex_y, v_uv).a);
     }
 
-    vec3 rgb = to_rgb(yuv, uf.color_range, uf.colorspace);
+    vec3 rgb = to_rgb(yuv, 2, 2);
     o_color = vec4(rgb, 1.0);
 }

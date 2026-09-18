@@ -193,6 +193,8 @@ public:
             });
         }
 
+        createGraphicsPipeline(device, swapChainSurfaceFormat.format);
+
         ass_library = ass_library_init();
     }
 
@@ -225,7 +227,6 @@ public:
                 subtitle_codec_ctx->subtitle_header_size
             );
 
-            createGraphicsPipeline(device, swapChainSurfaceFormat.format);
             return true;
         }
         return false;
@@ -267,6 +268,13 @@ public:
     void flush() {
         if (ass_track)
             ass_flush_events(ass_track);
+        
+        data[dataIdx].status = DataSet::Discard;
+        auto next_idx = (dataIdx + 1) % N_INFLIGHT;
+        auto& sd = data[next_idx];
+        if (sd.status == DataSet::Upload) {
+            sd.status = DataSet::Discard;
+        }
     }
 
     void add_ass(const std::string& text, long long pts, long long duration) {
@@ -303,7 +311,7 @@ public:
         ds.commandBuffer.begin(begin_info);
 
         uint32_t i = 0;
-        for (; i < ds.n_images; i++) {
+        for (; i < textureCount; i++) {
             auto& id = ds.images[i];
 //            SDL_Log("idx %i atlas %i vertices %i\n", dataIdx, ad.atlas_pool.in_use_list.size(), atlas->vertices.size());
             vk::ImageMemoryBarrier2 imageBarrier = {

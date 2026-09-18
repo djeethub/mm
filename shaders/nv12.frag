@@ -4,7 +4,6 @@ layout(push_constant, std430) uniform pc {
     layout(offset = 16) vec2  u_tex_size;
 };
 
-// Texture bindings
 layout(set = 0, binding = 0) uniform sampler2D u_tex;
 
 layout(location = 0) in vec2 v_uv;
