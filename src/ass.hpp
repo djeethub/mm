@@ -7,217 +7,9 @@
 #include "ass.vert.h"
 #include "ass.frag.h"
 
-struct AtlasRegion {
-    float u0, v0; // Top-Left UV
-    float u1, v1; // Bottom-Right UV
-};
-
-struct Vertex {
-    float x, y;
-    float w, h;
-    AtlasRegion uv;
-    float r, g, b, a;
-};
-
-struct Atlas {
-    vk::raii::Image image = nullptr;
-    vk::raii::DeviceMemory memory = nullptr;
-    vk::raii::ImageView imageView = nullptr;
-    vk::raii::Buffer up_buffer = nullptr;
-    vk::raii::DeviceMemory up_memory = nullptr;
-    vk::raii::DescriptorSet set = nullptr;
-
-    vk::raii::Buffer *vert_buf = nullptr;
-    int vert_size;
-    Uint32 w;
-    Uint32 h;
-    std::vector<Vertex> vertices;
-    std::vector<vk::BufferImageCopy2> regions;
-
-// Shelf packer state
-    uint32_t current_x = 0;
-    uint32_t current_y = 0;
-    uint32_t current_shelf_height = 0;
-    const uint32_t padding = 1; // 1px padding to avoid bilinear filtering artifacts
-    Uint32 offset;
-
-    // Allocate space for a new glyph inside the atlas
-    bool alloc_region(uint32_t glyph_w, uint32_t glyph_h, uint32_t& out_x, uint32_t& out_y, AtlasRegion& out_uv) {
-        uint32_t alloc_w = glyph_w + padding;
-        uint32_t alloc_h = glyph_h + padding;
-
-        // Check if glyph fits on the current shelf
-        if (current_x + alloc_w > w) {
-            // Move down to next shelf
-            current_y += current_shelf_height;
-            current_x = 0;
-            current_shelf_height = 0;
-        }
-
-        // Check if atlas is completely full
-        if (current_y + alloc_h > h) {
-            return false; // Atlas full! Needs flush or clear.
-        }
-
-        out_x = current_x;
-        out_y = current_y;
-
-        // Calculate normalized UV coordinates
-        out_uv.u0 = (float)out_x / (float)w;
-        out_uv.v0 = (float)out_y / (float)h;
-        out_uv.u1 = (float)glyph_w / (float)w;
-        out_uv.v1 = (float)glyph_h / (float)h;
-
-        // Update shelf trackers
-        current_x += alloc_w;
-        if (alloc_h > current_shelf_height) {
-            current_shelf_height = alloc_h;
-        }
-
-        return true;
-    }
-
-    // Reset atlas state when cleared (or when seeking video)
-    void reset() {
-        vertices.clear();
-        current_x = 0;
-        current_y = 0;
-        current_shelf_height = 0;
-        offset = 0;
-        vert_buf = nullptr;
-    }
-};
-
-class AtlasPool : public GPUPool<Atlas> {
-public:
-    using GPUPool<Atlas>::GPUPool;
-
-    Atlas *alloc(const vk::raii::Device&device, Uint32 w, Uint32 h) {
-        if (!list.empty()) {
-            auto data = list.back();
-            list.pop_back();
-            return data;
-        }
-
-        auto atlas = new Atlas{.w = w, .h = h};
-
-        vk::ImageCreateInfo info = {
-            .imageType = vk::ImageType::e2D,
-            .format = vk::Format::eR8Unorm,
-            .extent = { .width = (uint32_t) w, .height = (uint32_t) h, .depth = 1 },
-            .mipLevels = 1,
-            .arrayLayers = 1,
-            .samples = vk::SampleCountFlagBits::e1,
-            .tiling = vk::ImageTiling::eOptimal,
-            .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
-            .sharingMode = vk::SharingMode::eExclusive,
-            .initialLayout = vk::ImageLayout::eUndefined,
-        };
-        atlas->image = device.createImage(info);
-        auto req = atlas->image.getMemoryRequirements();
-        vk::MemoryAllocateInfo mem_alloc_info = {};
-        mem_alloc_info.allocationSize = req.size;
-        mem_alloc_info.memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal);
-        atlas->memory = device.allocateMemory(mem_alloc_info);
-        atlas->image.bindMemory(atlas->memory, 0);
-
-        vk::ImageViewCreateInfo viewInfo{
-            .image = atlas->image,     // The VkImage containing your uploaded AVFrame data
-            .viewType = vk::ImageViewType::e2D,
-            .format = info.format,
-            .subresourceRange = {
-                .aspectMask = vk::ImageAspectFlagBits::eColor, // Vulkan handles sub-planes internally
-                .levelCount = 1,
-                .layerCount = 1
-            }
-        };
-        atlas->imageView = device.createImageView(viewInfo);
-        
-        auto upload_size = w * h;
-        {
-            vk::BufferCreateInfo buffer_info = {
-                .size = upload_size,
-                .usage = vk::BufferUsageFlagBits::eTransferSrc,
-                .sharingMode = vk::SharingMode::eExclusive
-            };
-            atlas->up_buffer = device.createBuffer(buffer_info);
-            auto req = atlas->up_buffer.getMemoryRequirements();
-            vk::MemoryAllocateInfo alloc_info = {
-                .allocationSize = req.size,
-                .memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)
-            };
-            atlas->up_memory = device.allocateMemory(alloc_info);
-            atlas->up_buffer.bindMemory(atlas->up_memory, 0);
-        }
-
-        return atlas;
-    }
-};
-
-struct VertexBuf {
-    vk::raii::Buffer buf = nullptr;
-    vk::raii::DeviceMemory memory = nullptr;
-    Uint32 size;
-
-    void reset() {}
-};
-
-class VertexPool : public GPUPool<VertexBuf> {
-public:
-    using GPUPool<VertexBuf>::GPUPool;
-
-    VertexBuf *alloc(const vk::raii::Device& device, Uint32 size) {
-        while (!list.empty()) {
-            auto data = list.back();
-            list.pop_back();
-            if (data->size >= size)
-                return data;
-            delete data;
-        }
-
-        size *= 3;
-        auto vert_buf = new VertexBuf{.size = size};
-
-        vk::BufferCreateInfo buffer_info = {
-            .size = size,
-            .usage = vk::BufferUsageFlagBits::eStorageBuffer,
-            .sharingMode = vk::SharingMode::eExclusive
-        };
-        vert_buf->buf = device.createBuffer(buffer_info);
-        auto req = vert_buf->buf.getMemoryRequirements();
-        vk::MemoryAllocateInfo alloc_info = {
-            .allocationSize = req.size,
-            .memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)
-        };
-        vert_buf->memory = device.allocateMemory(alloc_info);
-        vert_buf->buf.bindMemory(vert_buf->memory, 0);
-
-        return vert_buf;
-    }
-};
-
-struct AssData {
-    enum Status {
-        None,
-        Init,
-        Upload,
-        Ready,
-        Discard
-    };
-
-    vk::raii::CommandBuffer commandBuffer = nullptr;
-    vk::raii::Fence copyFence = nullptr;
-
-    AtlasPool atlas_pool;
-    VertexPool vertex_pool;
-
-    Status status = None;
-    double play_time;
-};
-
 class SubAss : public AppSubtitle {
 private:
-    std::vector<AssData> data;
+    std::vector<DataSet> data;
     int dataIdx = 0;
 
     ASS_Library *ass_library = nullptr;
@@ -306,11 +98,6 @@ public:
     }
 
     void shutdown() {
-        for (auto& ad : data) {
-            ad.atlas_pool.clear();
-            ad.vertex_pool.clear();
-        }
-
         if (ass_track) {
             ass_free_track(ass_track);
             ass_track = nullptr;
@@ -344,9 +131,8 @@ public:
             {
                 .binding = 0,
                 .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-                .descriptorCount = 1,
+                .descriptorCount = N_MAX_SUBS,
                 .stageFlags = vk::ShaderStageFlagBits::eFragment,
-                .pImmutableSamplers = &*sampler // <-- Baked directly into the layout binding!
             },
             {
                 .binding = 1,
@@ -363,16 +149,24 @@ public:
 
         vk::DescriptorPoolSize pool_sizes[] =
         {
-            { vk::DescriptorType::eCombinedImageSampler, N_INFLIGHT * 3 },
-            { vk::DescriptorType::eStorageBuffer, N_INFLIGHT * 3 },
+            { vk::DescriptorType::eCombinedImageSampler, N_INFLIGHT * N_MAX_SUBS },
+            { vk::DescriptorType::eStorageBuffer, N_INFLIGHT },
         };
         vk::DescriptorPoolCreateInfo pool_info{
             .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
-            .maxSets = N_INFLIGHT * 3,
+            .maxSets = N_INFLIGHT,
             .poolSizeCount = (uint32_t)IM_COUNTOF(pool_sizes),
             .pPoolSizes = pool_sizes
         };
         pool = device.createDescriptorPool(pool_info);
+
+        std::vector<vk::DescriptorSetLayout> layouts(N_INFLIGHT, layout);
+        vk::DescriptorSetAllocateInfo alloc_info{
+            .descriptorPool = pool, // The pool we just created
+            .descriptorSetCount = N_INFLIGHT,
+            .pSetLayouts = layouts.data() // Your predefined VkDescriptorSetLayout
+        };
+        auto sets = device.allocateDescriptorSets(alloc_info);
 
         vk::CommandPoolCreateInfo poolInfo = {
             .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
@@ -392,9 +186,10 @@ public:
         };
 
         for (auto i = 0; i < N_INFLIGHT; i++) {
-            data.emplace_back(AssData{
-                .commandBuffer = std::move(commandBuffers[i]),
+            data.push_back({
                 .copyFence = device.createFence(fence_info),
+                .set = std::move(sets[i]),
+                .commandBuffer = std::move(commandBuffers[i]),
             });
         }
 
@@ -484,35 +279,32 @@ public:
         );
     }
 
-    void upload_atlas(AssData& ad, const vk::raii::Queue& queue) {
-        if (ad.atlas_pool.in_use_list.empty())
+    void upload_data(DataSet& ds, const vk::raii::Queue& queue) {
+        if (ds.n_images == 0)
             return;
 
-//        std::println("atlas count: {}", 2);
+        auto size = ds.vertices.size() * sizeof(Vertex);
+        ds.alloc_buf(device, size);
 
-        for (auto& atlas : ad.atlas_pool.in_use_list) {
-//            SDL_Log("idx %i atlas %i vertices %i\n", dataIdx, ad.atlas_pool.in_use_list.size(), atlas->vertices.size());
+        uint8_t *map = (uint8_t *) ds.memory.mapMemory(0, size);
+        uint8_t *src = (uint8_t *) ds.vertices.data();
+        memcpy(map, src, size);
+        ds.memory.unmapMemory();
 
-            Uint32 size = atlas->vertices.size() * sizeof(Vertex);
-            auto vert = ad.vertex_pool.alloc(device, size);
+        auto textureCount = ds.n_images;
+        std::vector<vk::DescriptorImageInfo> imageInfos(textureCount);
+        std::vector<vk::WriteDescriptorSet> descriptorWrites(textureCount + 1);
 
-            uint8_t *map = (uint8_t *) vert->memory.mapMemory(0, size);
-            uint8_t *src = (uint8_t *) atlas->vertices.data();
-            memcpy(map, src, size);
-            vert->memory.unmapMemory();
-            atlas->vert_buf = &vert->buf;
-            atlas->vert_size = size;
-            ad.vertex_pool.in_use(vert);
-        }
-
-        device.resetFences(*ad.copyFence);
-        ad.commandBuffer.reset();
+        device.resetFences(*ds.copyFence);
+        ds.commandBuffer.reset();
         vk::CommandBufferBeginInfo begin_info{
             .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit
         };
-        ad.commandBuffer.begin(begin_info);
+        ds.commandBuffer.begin(begin_info);
 
-        for (auto& atlas : ad.atlas_pool.in_use_list) {
+        uint32_t i = 0;
+        for (; i < ds.n_images; i++) {
+            auto& id = ds.images[i];
 //            SDL_Log("idx %i atlas %i vertices %i\n", dataIdx, ad.atlas_pool.in_use_list.size(), atlas->vertices.size());
             vk::ImageMemoryBarrier2 imageBarrier = {
                 .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader | vk::PipelineStageFlagBits2::eHost,
@@ -522,7 +314,7 @@ public:
                 .newLayout = vk::ImageLayout::eTransferDstOptimal,
                 .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
                 .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
-                .image = *atlas->image,
+                .image = *id.image,
                 .subresourceRange = {
                     .aspectMask = vk::ImageAspectFlags::BitsType::eColor,
                     .levelCount = 1,
@@ -533,16 +325,23 @@ public:
                 .imageMemoryBarrierCount = 1,
                 .pImageMemoryBarriers = &imageBarrier,
             };
-            ad.commandBuffer.pipelineBarrier2(dep_info);
+            ds.commandBuffer.pipelineBarrier2(dep_info);
 
-            vk::CopyBufferToImageInfo2 copy_info = {
-                .srcBuffer = atlas->up_buffer,
-                .dstImage = atlas->image,
-                .dstImageLayout = vk::ImageLayout::eTransferDstOptimal,
-                .regionCount = (uint32_t)atlas->regions.size(),
-                .pRegions = atlas->regions.data(),
+            vk::BufferImageCopy2 region{
+                .imageSubresource = {
+                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+                    .layerCount = 1,
+                },
+                .imageExtent = {id.w, id.h, 1},
             };
-            ad.commandBuffer.copyBufferToImage2(copy_info);
+            vk::CopyBufferToImageInfo2 copy_info = {
+                .srcBuffer = id.up_buffer,
+                .dstImage = id.image,
+                .dstImageLayout = vk::ImageLayout::eTransferDstOptimal,
+                .regionCount = 1,
+                .pRegions = &region,
+            };
+            ds.commandBuffer.copyBufferToImage2(copy_info);
 
             imageBarrier = {
                 .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
@@ -553,7 +352,7 @@ public:
                 .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
                 .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
                 .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
-                .image = *atlas->image,
+                .image = *id.image,
                 .subresourceRange = {
                     .aspectMask = vk::ImageAspectFlags::BitsType::eColor,
                     .levelCount = 1,
@@ -564,56 +363,42 @@ public:
                 .imageMemoryBarrierCount = 1,
                 .pImageMemoryBarriers = &imageBarrier,
             };
-            ad.commandBuffer.pipelineBarrier2(dep_info);
+            ds.commandBuffer.pipelineBarrier2(dep_info);
 
-//            atlas->newly_created = false;
+            // Define the image view and sampler for this array slot
+            imageInfos[i] = {
+                .sampler     = sampler,
+                .imageView   = id.imageView,
+                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            };
+            descriptorWrites[i] = {
+                .dstSet          = ds.set,
+                .dstArrayElement = i,
+                .descriptorCount = 1,
+                .descriptorType  = vk::DescriptorType::eCombinedImageSampler,
+                .pImageInfo      = &imageInfos[i],
+            };
         }
 
-        ad.commandBuffer.end();
+        ds.commandBuffer.end();
         vk::SubmitInfo end_info = {
             .commandBufferCount = 1,
-            .pCommandBuffers = &*ad.commandBuffer
+            .pCommandBuffers = &*ds.commandBuffer
         };
-        queue.submit(end_info, ad.copyFence);
+        queue.submit(end_info, ds.copyFence);
 
-        for (auto& atlas : ad.atlas_pool.in_use_list) {
-            if (!*atlas->set) {
-                // Allocate a descriptor set from the pool
-                vk::DescriptorSetAllocateInfo alloc_info{
-                    .descriptorPool = pool, // The pool we just created
-                    .descriptorSetCount = 1,
-                    .pSetLayouts = &*layout // Your predefined VkDescriptorSetLayout
-                };
-                atlas->set = std::move(device.allocateDescriptorSets(alloc_info)[0]);
-            }
-
-            //Update the Descriptor Set
-            vk::DescriptorImageInfo imageInfo{
-                .imageView = atlas->imageView,
-                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
-            };
-            vk::DescriptorBufferInfo bufInfo{
-                .buffer = *atlas->vert_buf,
-                .range = (vk::DeviceSize)atlas->vert_size
-            };
-            vk::WriteDescriptorSet descriptorWrites[] = {
-                {
-                    .dstSet = atlas->set,
-                    .dstBinding = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-                    .pImageInfo = &imageInfo,
-                },
-                {
-                    .dstSet = atlas->set,
-                    .dstBinding = 1,
-                    .descriptorCount = 1,
-                    .descriptorType = vk::DescriptorType::eStorageBuffer,
-                    .pBufferInfo = &bufInfo,
-                },
-            };
-            device.updateDescriptorSets(descriptorWrites, nullptr);
-        }
+        vk::DescriptorBufferInfo bufInfo{
+            .buffer = *ds.buffer,
+            .range = (vk::DeviceSize)size
+        };
+        descriptorWrites[i] = {
+            .dstSet = ds.set,
+            .dstBinding = 1,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &bufInfo,
+        };
+        device.updateDescriptorSets(descriptorWrites, nullptr);
     }
 
     void prepare_draw(const vk::raii::Queue& queue, double play_time) {
@@ -621,8 +406,8 @@ public:
             return;
 
         auto next_idx = (dataIdx + 1) % N_INFLIGHT;
-        auto& ad = data[next_idx];
-        auto err = device.waitForFences(*ad.copyFence, vk::True, 0);
+        auto& ds = data[next_idx];
+        auto err = device.waitForFences(*ds.copyFence, vk::True, 0);
         if (err != vk::Result::eSuccess)
             return;
 
@@ -632,92 +417,64 @@ public:
         if (changed == 0)
             return;
 
-        ad.atlas_pool.recycle();
-        ad.vertex_pool.recycle();
+        ds.vertices.clear();
 
+        int idx = 0;
+        int alloc_images = ds.images.size();
         // 3. Draw the active text lines over the frame canvas
-        Atlas *atlas = nullptr;
         for (; img; img = img->next) {
 //            printf("SUCCESS: libass generated image chunks! w=%d, h=%d at position x=%d, y=%d\n", img->w, img->h, img->dst_x, img->dst_y);
             if (img->w == 0 || img->h == 0)
                 continue;
 
-            uint32_t out_x, out_y;
-            AtlasRegion out_uv;
-            while (true) {
-                if (!atlas) {
-                    atlas = ad.atlas_pool.alloc(device, wnd_w, wnd_h);
-                }
-                if (atlas->alloc_region(img->w, img->h, out_x, out_y, out_uv))
-                    break;
-                if (atlas->vertices.empty()) {
-                    delete atlas;
-                    throw std::runtime_error("too large ass img.");
-                } else {
-                    ad.atlas_pool.in_use(atlas);
-                }
-                atlas = nullptr;
-            }
+            if (idx >= alloc_images)
+                ds.images.emplace_back();
+            ImageData& id = ds.images[idx];
+            id.init(device, img->w, img->h);
 
-            uint8_t *map = (uint8_t *) atlas->up_memory.mapMemory(atlas->offset, img->w * img->h);
+            uint8_t *map = (uint8_t *) id.up_memory.mapMemory(0, img->w * img->h);
             const uint8_t* src = img->bitmap;
             for (int y = 0; y < img->h; ++y) {
                 memcpy(map + (y * img->w), src + (y * img->stride), img->w);
             }
-            atlas->up_memory.unmapMemory();
-
-            atlas->regions.push_back({
-                .bufferOffset = atlas->offset,
-                .imageSubresource = {
-                    .aspectMask = vk::ImageAspectFlagBits::eColor,
-                    .layerCount = 1,
-                },
-                .imageOffset = { (int32_t)out_x, (int32_t)out_y},
-                .imageExtent = { (uint32_t)img->w, (uint32_t)img->h, 1 }
-            });
-            atlas->offset += img->w * img->h;
-
+            id.up_memory.unmapMemory();
+            
             uint32_t c = img->color;
             float r = ((c >> 24) & 0xFF) / 255.0f;
             float g = ((c >> 16) & 0xFF) / 255.0f;
             float b = ((c >> 8)  & 0xFF) / 255.0f;
             float a = (255 - (c & 0xFF)) / 255.0f;
 
-            atlas->vertices.push_back({
+            ds.vertices.push_back({
                 2.0f * img->dst_x / wnd_w - 1.0f, 1.0f - 2.0f * img->dst_y / wnd_h,
                 2.0f * img->w / wnd_w, 2.0f * img->h / wnd_h,
-                out_uv,
-                r, g, b, a
+                r, g, b, a,
+                (float) img->w / id.alloc_w, (float) img->h / id.alloc_h
             });
+            idx++;
         }
-        if (atlas) {
-            ad.atlas_pool.in_use(atlas);
-        }
+        ds.n_images = idx;
 
-        upload_atlas(ad, queue);
-        ad.status = AssData::Upload;
-        ad.play_time = play_time;
+        upload_data(ds, queue);
+        ds.status = DataSet::Upload;
+        ds.play_time = play_time;
     }
 
     void draw(const vk::CommandBuffer commandBuffer) {
-        auto& ad = data[dataIdx];
-        if (ad.status != AssData::Ready)
+        auto& ds = data[dataIdx];
+        if (ds.status != DataSet::Ready)
             return;
 
-        auto& list = ad.atlas_pool.in_use_list;
-        if (list.empty())
+        if (ds.n_images == 0)
             return;
 
-        auto err = device.waitForFences(*ad.copyFence, vk::True, 0);
+        auto err = device.waitForFences(*ds.copyFence, vk::True, 0);
         if (err != vk::Result::eSuccess)
             return;
 
         commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
-        for (auto atlas : list) {
-//            SDL_Log("atlas draw\n");
-            commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0, *atlas->set, nullptr);
-            commandBuffer.draw(atlas->vertices.size() * 6, 1, 0, 0);
-        }
+        commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0, *ds.set, nullptr);
+        commandBuffer.draw(ds.vertices.size() * 6, 1, 0, 0);
     }
 
     void window_size_changed(Sint32 w, Sint32 h) {
@@ -730,17 +487,17 @@ public:
     bool check_next_frame(double play_time) {
         auto next_idx = (dataIdx + 1) % N_INFLIGHT;
         auto& ad = data[next_idx];
-        if (ad.status == AssData::Upload) {
+        if (ad.status == DataSet::Upload) {
             if (ad.play_time <= play_time) {
                 auto err = device.waitForFences(*ad.copyFence, vk::True, 0);
                 if (err == vk::Result::eSuccess) {
-                    ad.status = AssData::Ready;
+                    ad.status = DataSet::Ready;
                     dataIdx = next_idx;
                     return true;
                 }
             }
             return false;
-        } else if (ad.status == AssData::Discard) {
+        } else if (ad.status == DataSet::Discard) {
             auto err = device.waitForFences(*ad.copyFence, vk::True, 0);
             if (err == vk::Result::eSuccess) {
                 return true;

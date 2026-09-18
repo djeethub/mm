@@ -237,16 +237,16 @@ private:
 		}
 
 		// query for Vulkan 1.3 features
-		vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT, vk::PhysicalDeviceSamplerYcbcrConversionFeatures> featureChain = {
+		vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT, vk::PhysicalDeviceSamplerYcbcrConversionFeatures, vk::PhysicalDeviceDescriptorIndexingFeatures> featureChain = {
 		    {.features = {.samplerAnisotropy = true}},                   // vk::PhysicalDeviceFeatures2
 		    {.synchronization2 = true, .dynamicRendering = true},        // vk::PhysicalDeviceVulkan13Features
 		    {.extendedDynamicState = true},                               // vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT
 			{.samplerYcbcrConversion = true},
-//			{.shaderSampledImageArrayNonUniformIndexing = true, .runtimeDescriptorArray = true},, vk::PhysicalDeviceDescriptorIndexingFeatures
+			{.shaderSampledImageArrayNonUniformIndexing = true, .runtimeDescriptorArray = true},
 		};
 
 		// create a Device
-		float                     queuePriority = 0.5f;
+		float                     queuePriority = 1.0f;
 		vk::DeviceQueueCreateInfo deviceQueueCreateInfo{.queueFamilyIndex = queueIndex, .queueCount = 1, .pQueuePriorities = &queuePriority};
 		vk::DeviceCreateInfo      deviceCreateInfo{.pNext                   = &featureChain.get<vk::PhysicalDeviceFeatures2>(),
 		                                           .queueCreateInfoCount    = 1,

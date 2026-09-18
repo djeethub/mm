@@ -1,14 +1,16 @@
 #version 450
+#extension GL_EXT_nonuniform_qualifier : enable
 
-layout(set = 0, binding = 0) uniform sampler2D uTexture;
+layout(set = 0, binding = 0) uniform sampler2D uTexture[];
 
 layout(location = 0) in vec2 inUV;
 layout(location = 1) in vec4 inColor;
+layout(location = 2) flat in uint inId;
 layout(location = 0) out vec4 outColor;
 
 void main() {
     // 1. Sample glyph alpha mask (R channel from R8_UNORM texture atlas)
-    float alphaMask = texture(uTexture, inUV).r;
+    float alphaMask = texture(uTexture[nonuniformEXT(inId)], inUV).r;
 
     // 2. Combine glyph shape mask with incoming per-vertex RGBA color
     outColor = vec4(inColor.rgb, inColor.a * alphaMask);

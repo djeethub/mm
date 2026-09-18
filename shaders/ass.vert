@@ -3,9 +3,8 @@
 struct SpriteInstance {
     vec2 position;
     vec2 size;
-    vec2 uv;
-    vec2 uv_size;
     vec4 color;
+    vec2 uv;
 };
 
 layout(std430, set = 0, binding = 1) readonly buffer SpriteBuffer {
@@ -15,6 +14,7 @@ layout(std430, set = 0, binding = 1) readonly buffer SpriteBuffer {
 // Outputs to Fragment Shader
 layout(location = 0) out vec2 outUV;
 layout(location = 1) out vec4 outColor;
+layout(location = 2) flat out uint outId;
 
 const vec2 unit_quad[6] = vec2[](
     vec2(0.0, -1.0), // Bottom-Left
@@ -43,6 +43,7 @@ void main() {
 
     vec2 finalPosition = (unit_quad[vertex_id] * sprite.size) + sprite.position;
     gl_Position = vec4(finalPosition, 0.0, 1.0);
-    outUV = (uvs[vertex_id] * sprite.uv_size) + sprite.uv;
+    outId = sprite_id;
+    outUV = uvs[vertex_id] * sprite.uv;
     outColor = sprite.color;
 }
