@@ -12,6 +12,8 @@ extern "C" {
 #include "vk_video.hpp"
 #include "subtitle.hpp"
 
+#define MAX_FRAMES_IN_FLIGHT	2
+
 #ifdef NDEBUG
 constexpr bool enableValidationLayers = false;
 #else
@@ -38,7 +40,6 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL debugCallback(vk::DebugUtilsMessageSever
 
 class AppVk {
 private:
-    const int      MAX_FRAMES_IN_FLIGHT = 2;
 	std::vector<const char *> requiredDeviceExtension = {
 	    vk::KHRSwapchainExtensionName,
 		vk::EXTExternalMemoryDmaBufExtensionName,
@@ -259,7 +260,7 @@ private:
 
 	void createCommandPool()
 	{
-		vk::CommandPoolCreateInfo poolInfo{.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+		vk::CommandPoolCreateInfo poolInfo{.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer | vk::CommandPoolCreateFlagBits::eTransient,
 		                                   .queueFamilyIndex = queueIndex};
 		commandPool = vk::raii::CommandPool(device, poolInfo);
 	}
@@ -556,8 +557,8 @@ public:
         if (vf.status != VkFrame::Ready)
             return;
 
-        commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *video.pipeline);
-		commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, video.pipelineLayout, 0, *vf.set, nullptr);
+        commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, video.pipeline);
+		commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, video.pipelineLayout, 0, vf.set, nullptr);
         auto scale = base_scale * video_scale;
 		float w = 2.0f * scale * vf.frame_data.frame->width / wnd_w;
 		float h = 2.0f * scale * vf.frame_data.frame->height / wnd_h;
@@ -608,10 +609,10 @@ public:
 
 		// Only reset the fence if we are submitting work
 		device.resetFences(*inFlightFences[frameIndex]);
-
         auto commandBuffer = *commandBuffers[frameIndex];
-		commandBuffer.reset();
-        vk::CommandBufferBeginInfo begin_info{};
+        vk::CommandBufferBeginInfo begin_info{
+			.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit
+		};
         commandBuffer.begin(begin_info);
 
         // Before starting rendering, transition the swapchain image to vk::ImageLayout::eColorAttachmentOptimal
@@ -661,15 +662,25 @@ public:
 		);
         commandBuffer.end();
 
-		vk::PipelineStageFlags waitDestinationStageMask(vk::PipelineStageFlagBits::eColorAttachmentOutput);
-		const vk::SubmitInfo   submitInfo{.waitSemaphoreCount   = 1,
-		                                  .pWaitSemaphores      = &*presentCompleteSemaphores[frameIndex],
-		                                  .pWaitDstStageMask    = &waitDestinationStageMask,
-		                                  .commandBufferCount   = 1,
-		                                  .pCommandBuffers      = &*commandBuffers[frameIndex],
-		                                  .signalSemaphoreCount = 1,
-		                                  .pSignalSemaphores    = &*renderFinishedSemaphores[imageIndex]};
-		queue.submit(submitInfo, *inFlightFences[frameIndex]);
+        vk::CommandBufferSubmitInfo cmd_info{
+            .commandBuffer = commandBuffers[frameIndex],
+        };
+		vk::SemaphoreSubmitInfo wait_info{
+			.semaphore = presentCompleteSemaphores[frameIndex],
+			.stageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+		};
+		vk::SemaphoreSubmitInfo signal_info{
+			.semaphore = renderFinishedSemaphores[imageIndex],
+		};
+        vk::SubmitInfo2 submit_info{
+			.waitSemaphoreInfoCount = 1,
+			.pWaitSemaphoreInfos = &wait_info,
+            .commandBufferInfoCount = 1,
+            .pCommandBufferInfos = &cmd_info,
+			.signalSemaphoreInfoCount = 1,
+			.pSignalSemaphoreInfos = &signal_info,
+        };
+        queue.submit2(submit_info, inFlightFences[frameIndex]);
 
 		const vk::PresentInfoKHR presentInfoKHR{.waitSemaphoreCount = 1,
 		                                        .pWaitSemaphores    = &*renderFinishedSemaphores[imageIndex],

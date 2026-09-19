@@ -7,13 +7,10 @@
 #include "vert.vert.h"
 #include "nv12.frag.h"
 #include "rgb.frag.h"
-#include "yuv.frag.h"
 #include "gray.frag.h"
-#include "pal8.frag.h"
-#include "yuv_10.frag.h"
 #include "yuyv.frag.h"
-#include "ya.frag.h"
-#include "yuva.frag.h"
+
+#define N_INFLIGHT_VIDEO    4
 
 enum ShaderType
 {
@@ -91,29 +88,22 @@ struct VkFrame {
     vk::raii::Buffer upload_buffer = nullptr;
     vk::raii::DeviceMemory upload_buffer_memory = nullptr;
     vk::raii::Fence copyFence = nullptr;
-    vk::raii::DescriptorSet set = nullptr;
-    vk::raii::CommandBuffer commandBuffer = nullptr;
+    vk::DescriptorSet set = nullptr;
+    vk::CommandBuffer commandBuffer = nullptr;
 
     AvFrameData frame_data;
     Status status = None;
-
-    void reset() {
-        commandBuffer.reset();
-        set.clear();
-    }
 };
 
 class VkVideo {
 private:
-    inline static const int N_FRAMES = 4;
-
     vk::raii::SamplerYcbcrConversion ycbcrConversion = nullptr;
     vk::raii::Sampler sampler = nullptr;
     vk::raii::DescriptorSetLayout layout = nullptr;
     vk::raii::DescriptorPool pool = nullptr;
     vk::raii::CommandPool commandPool = nullptr;
 
-    VkFrame frames[N_FRAMES];
+    VkFrame frames[N_INFLIGHT_VIDEO];
     int frame_idx = 0;
 
     vk::Format format;
@@ -235,6 +225,10 @@ private:
 			shader_info.pCode = (uint32_t *) yuyv_frag;
 			shader_info.codeSize = yuyv_frag_len;
             break;
+        case GRAY_FRAG:
+			shader_info.pCode = (uint32_t *) gray_frag;
+			shader_info.codeSize = gray_frag_len;
+            break;
         }
 
         return device.createShaderModule(shader_info);
@@ -249,7 +243,7 @@ public:
 
     void init_once(const vk::raii::Device& device) {
         vk::CommandPoolCreateInfo poolInfo = {
-            .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+            .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer | vk::CommandPoolCreateFlagBits::eTransient,
             .queueFamilyIndex = queueIndex
         };
         commandPool = device.createCommandPool(poolInfo);
@@ -257,17 +251,17 @@ public:
         vk::CommandBufferAllocateInfo allocInfo = {
             .commandPool = commandPool,
             .level = vk::CommandBufferLevel::ePrimary,
-            .commandBufferCount = N_FRAMES
+            .commandBufferCount = N_INFLIGHT_VIDEO
         };
-        auto commandBuffers = device.allocateCommandBuffers(allocInfo);
+        auto commandBuffers = (*device).allocateCommandBuffers(allocInfo);
 
         vk::DescriptorPoolSize pool_sizes[] =
         {
-            { vk::DescriptorType::eCombinedImageSampler, N_FRAMES * 4 },
+            { vk::DescriptorType::eCombinedImageSampler, N_INFLIGHT_VIDEO * 4 },
         };
         vk::DescriptorPoolCreateInfo pool_info{
-            .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
-            .maxSets = N_FRAMES,
+//            .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+            .maxSets = N_INFLIGHT_VIDEO,
             .poolSizeCount = (uint32_t)IM_COUNTOF(pool_sizes),
             .pPoolSizes = pool_sizes
         };
@@ -277,8 +271,8 @@ public:
             .flags = vk::FenceCreateFlagBits::eSignaled,
         };
 
-        for (auto i = 0; i < N_FRAMES; i++) {
-            frames[i].commandBuffer = std::move(commandBuffers[i]);
+        for (auto i = 0; i < N_INFLIGHT_VIDEO; i++) {
+            frames[i].commandBuffer = commandBuffers[i];
             frames[i].copyFence = device.createFence(fence_info);
         }
     }
@@ -295,6 +289,22 @@ public:
         if (format == pix_fmt && width == frame->width && height == frame->height)
             return true;
         return false;
+    }
+
+    bool is_supported(vk::Format format, const vk::raii::PhysicalDevice& physicalDevice) {
+        try {
+            vk::PhysicalDeviceImageFormatInfo2 format_info{
+                .format = format,
+                .type = vk::ImageType::e2D,
+                .tiling = vk::ImageTiling::eOptimal,
+                .usage = vk::ImageUsageFlagBits::eSampled,
+//                .flags = vk::ImageCreateFlagBits::eMutableFormat,
+            };
+            auto imageProps = physicalDevice.getImageFormatProperties2(format_info);
+        } catch (const vk::FormatNotSupportedError& err) {
+            return false;
+        }
+        return true;
     }
 
     bool init(const AVFrame *frame, const vk::raii::PhysicalDevice& physicalDevice, vk::raii::Device& device) {
@@ -354,7 +364,7 @@ public:
                 format = vk::Format::eG8B8G8R8422Unorm;
                 break;
             case AV_PIX_FMT_GRAY8:
-                format = vk::Format::eA8Unorm;
+                format = vk::Format::eR8Unorm;
                 break;
             case AV_PIX_FMT_RGBA:
                 format = vk::Format::eR8G8B8A8Unorm;
@@ -362,40 +372,62 @@ public:
             case AV_PIX_FMT_BGRA:
                 format = vk::Format::eB8G8R8A8Unorm;
                 break;
-            case AV_PIX_FMT_YUVA420P:
-                native = false;
-                break;
+//            case AV_PIX_FMT_YUVA420P:
+//            case AV_PIX_FMT_PAL8:
+//            case AV_PIX_FMT_YA8:
             default:
-                auto msg = std::format("Unsupported pix fmt: {}", av_get_pix_fmt_name(pix_fmt));
-                throw std::runtime_error(msg.c_str());
+                if (frame->hw_frames_ctx) {
+                    auto msg = std::format("Unsupported pix fmt: {}", av_get_pix_fmt_name(pix_fmt));
+                    throw std::runtime_error(msg.c_str());
+                }
+                native = false;
         }
 
         if (native) {
-            try {
-                vk::PhysicalDeviceImageFormatInfo2 format_info{
-                    .format = format,
-                    .type = vk::ImageType::e2D,
-                    .tiling = vk::ImageTiling::eOptimal,
-                    .usage = vk::ImageUsageFlagBits::eSampled,
-    //                .flags = vk::ImageCreateFlagBits::eMutableFormat,
-                };
-                auto imageProps = physicalDevice.getImageFormatProperties2(format_info);
-            } catch (const vk::FormatNotSupportedError& err) {
-                native = false;
-            }
+            native = is_supported(format, physicalDevice);
         }
         if (!native) {
-            if (!frame->hw_frames_ctx) {
-                setup_sws_context(pix_fmt, AV_PIX_FMT_RGBA);
+            if (frame->hw_frames_ctx) { // AV_PIX_FMT_YUYV422
+                format = vk::Format::eR8G8B8A8Unorm;
+                n_planes = 1;
+                bpp = 4;
+            } else {
+                AVPixelFormat new_pix_fmt;
+                switch (pix_fmt) {
+                case AV_PIX_FMT_BGR24:
+                case AV_PIX_FMT_PAL8:
+                case AV_PIX_FMT_RGB32:
+                    new_pix_fmt = AV_PIX_FMT_BGRA;
+                    format = vk::Format::eB8G8R8A8Unorm;
+                    n_planes = 1;
+                    bpp = 4;
+                    break;
+                case AV_PIX_FMT_YUV420P10:
+                    new_pix_fmt = AV_PIX_FMT_P010;
+                    format = vk::Format::eG10X6B10X6R10X62Plane420Unorm3Pack16;
+                    n_planes = 2;
+                    bpp = 2;
+                    break;
+                case AV_PIX_FMT_RGB24:
+                case AV_PIX_FMT_BGR32:
+                default:
+                    new_pix_fmt = AV_PIX_FMT_RGBA;
+                    format = vk::Format::eR8G8B8A8Unorm;
+                    n_planes = 1;
+                    bpp = 4;
+                }
+                if (!is_supported(format, physicalDevice)) {
+                    new_pix_fmt = AV_PIX_FMT_RGBA;
+                    format = vk::Format::eR8G8B8A8Unorm;
+                    n_planes = 1;
+                    bpp = 4;
+                }
+                setup_sws_context(pix_fmt, new_pix_fmt);
             }
-            format = vk::Format::eR8G8B8A8Unorm;
-            n_planes = 1;
-            bpp = 4;
         }
 
-        for (auto& x : frames) {
-            x.reset();
-        }
+        commandPool.reset();
+        pool.reset();
 
         vk::FormatProperties2 props = physicalDevice.getFormatProperties2(format);
         auto features = props.formatProperties.optimalTilingFeatures;
@@ -439,6 +471,7 @@ public:
             }
             switch (frame->colorspace) {
                 case AVCOL_SPC_BT709:
+                case AVCOL_SPC_UNSPECIFIED:
                     ycbcrInfo.ycbcrModel = vk::SamplerYcbcrModelConversion::eYcbcr709;
                     break;
                 case AVCOL_SPC_BT2020_CL:
@@ -450,6 +483,7 @@ public:
                     break;
                 case AVCOL_SPC_BT470BG:
                 case AVCOL_SPC_SMPTE170M:
+                case AVCOL_SPC_SMPTE240M:
                 default:
                     ycbcrInfo.ycbcrModel = vk::SamplerYcbcrModelConversion::eYcbcr601;
             }
@@ -470,17 +504,17 @@ public:
         };
         layout = device.createDescriptorSetLayout(layoutInfo);
 
-        std::vector<vk::DescriptorSetLayout> layouts(N_FRAMES, layout);
+        std::vector<vk::DescriptorSetLayout> layouts(N_INFLIGHT_VIDEO, layout);
         // Allocate a descriptor set from the pool
         vk::DescriptorSetAllocateInfo alloc_info{
             .descriptorPool = pool, // The pool we just created
-            .descriptorSetCount = N_FRAMES,
+            .descriptorSetCount = N_INFLIGHT_VIDEO,
             .pSetLayouts = layouts.data() // Your predefined VkDescriptorSetLayout
         };
-        auto sets = device.allocateDescriptorSets(alloc_info);
+        auto sets = (*device).allocateDescriptorSets(alloc_info);
 
-        for (auto i = 0; i < N_FRAMES; i++) {
-            frames[i].set = std::move(sets[i]);
+        for (auto i = 0; i < N_INFLIGHT_VIDEO; i++) {
+            frames[i].set = sets[i];
             init_frame(i, frame, device);
         }
 
@@ -498,6 +532,9 @@ public:
                 shader_type = YUYV_FRAG;
             else
                 shader_type = RGB_FRAG;
+            break;
+        case vk::Format::eR8Unorm:
+            shader_type = GRAY_FRAG;
             break;
         default:
             shader_type = NV12_FRAG;
@@ -587,8 +624,6 @@ public:
             return;
         }
         vf.frame_data.mapped = drm_frame;
-
-        vf.imageView = nullptr;
 
         // drm_frame->data[0] now contains a pointer to an AVDRMFrameDescriptor struct
         AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)drm_frame->data[0];
@@ -696,7 +731,7 @@ public:
     }
 
     void upload(AvFrameData frame_data, const vk::raii::Device& device, const vk::raii::Queue& queue) {
-        auto next_idx = (frame_idx + 1) % N_FRAMES;
+        auto next_idx = (frame_idx + 1) % N_INFLIGHT_VIDEO;
         auto& vf = frames[next_idx];
         auto err = device.waitForFences(*vf.copyFence, vk::True, 0);
         if (err != vk::Result::eSuccess) {
@@ -713,11 +748,7 @@ public:
         int offset[4]{};
         // Upload to Buffer:
         uint8_t *map = (uint8_t *) vf.upload_buffer_memory.mapMemory(0, upload_size);
-        if (!native) {
-			uint8_t* dst_data[4] = { static_cast<uint8_t *>(map), NULL, NULL, NULL };
-			int dst_linesize[4]  = { static_cast<int>(width) * 4, 0, 0, 0 };
-			sws_scale(sws_ctx, &frame->data[0], &frame->linesize[0], 0, height, dst_data, dst_linesize);
-        } else {
+        if (native) {
             uint8_t *src = frame->data[0];
             auto map_save = map;
             auto bytes_per_line = width * bpp;
@@ -740,10 +771,25 @@ public:
                 }
 
                 if (n_planes > 3) {
-                    assert(false);
-    //                    bytes_per_line = width * bpp;
+                    throw std::runtime_error("(planes > 3) not supported.");
                 }
             }
+        } else {
+			uint8_t* dst_data[4];
+			int dst_linesize[4];
+            int inc = 0;
+            for (auto i = 0; i < n_planes; i++) {
+                offset[i] = inc;
+                dst_data[i] = map + inc;
+                if (i == 0)
+                    dst_linesize[i] = width * bpp;
+                else if (n_planes == 2)
+                    dst_linesize[i] = (width >> fmt_desc->log2_chroma_w) * bpp * 2;
+                else
+                    dst_linesize[i] = (width >> fmt_desc->log2_chroma_w) * bpp;
+                inc += dst_linesize[i] * (i == 0 ? height : height >> fmt_desc->log2_chroma_h);
+            }
+			sws_scale(sws_ctx, frame->data, frame->linesize, 0, height, dst_data, dst_linesize);
         }
 
 /*        VkMappedMemoryRange range[1] = {};
@@ -757,7 +803,6 @@ public:
         // Start command buffer
         {
             device.resetFences(*vf.copyFence);
-            vf.commandBuffer.reset();
             vk::CommandBufferBeginInfo begin_info{
                 .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit
             };
@@ -844,18 +889,21 @@ public:
         // End command buffer
         {
             vf.commandBuffer.end();
-            vk::SubmitInfo end_info = {};
-            end_info.commandBufferCount = 1;
-            end_info.pCommandBuffers = &*vf.commandBuffer;
-            queue.submit(end_info, vf.copyFence);
+            vk::CommandBufferSubmitInfo cmd_info{
+                .commandBuffer = vf.commandBuffer,
+            };
+            vk::SubmitInfo2 submit_info{
+                .commandBufferInfoCount = 1,
+                .pCommandBufferInfos = &cmd_info,
+            };
+            queue.submit2(submit_info, vf.copyFence);
         }
 
         vf.status = VkFrame::Upload;
-//        queue.waitIdle();
     }
 
     bool check_next_frame(double play_time, const vk::Device& device) {
-        auto next_idx = (frame_idx + 1) % N_FRAMES;
+        auto next_idx = (frame_idx + 1) % N_INFLIGHT_VIDEO;
         auto& vf = frames[next_idx];
         if (vf.status == VkFrame::Upload) {
             if (vf.frame_data.play_time <= play_time) {
@@ -882,8 +930,7 @@ public:
     }
 
     void discard_pending() {
-        frames[frame_idx].status = VkFrame::Discard;
-        auto next_idx = (frame_idx + 1) % N_FRAMES;
+        auto next_idx = (frame_idx + 1) % N_INFLIGHT_VIDEO;
         auto& vf = frames[next_idx];
         if (vf.status == VkFrame::Upload) {
             vf.status = VkFrame::Discard;
@@ -895,8 +942,8 @@ public:
 		sws_ctx = sws_getContext(
 			width, height, src_fmt,       // Source video specs
 			width, height, dst_fmt,        // Destination specs (GPU friendly)
-			SWS_BILINEAR,                          // Fast filter (since size is identical)
-			NULL, NULL, NULL
+			SWS_FAST_BILINEAR,                          // Fast filter (since size is identical)
+			nullptr, nullptr, nullptr
 		);
 /*        const int *inv_table, *table;
         int srcRange, dstRange, brightness, contrast, saturation;

@@ -2,7 +2,7 @@
 
 #include "vk_util.hpp"
 
-#define N_INFLIGHT 3
+#define N_INFLIGHT_SUB 3
 #define N_MAX_SUBS 999
 
 struct Vertex {
@@ -99,8 +99,8 @@ struct DataSet {
     Uint32 alloc_size = 0;
 
     vk::raii::Fence copyFence = nullptr;
-    vk::raii::DescriptorSet set = nullptr;
-    vk::raii::CommandBuffer commandBuffer = nullptr;
+    vk::DescriptorSet set = nullptr;
+    vk::CommandBuffer commandBuffer = nullptr;
 
     Status status = None;
     double play_time;

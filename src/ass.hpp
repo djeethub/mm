@@ -149,27 +149,27 @@ public:
 
         vk::DescriptorPoolSize pool_sizes[] =
         {
-            { vk::DescriptorType::eCombinedImageSampler, N_INFLIGHT * N_MAX_SUBS },
-            { vk::DescriptorType::eStorageBuffer, N_INFLIGHT },
+            { vk::DescriptorType::eCombinedImageSampler, N_INFLIGHT_SUB * N_MAX_SUBS },
+            { vk::DescriptorType::eStorageBuffer, N_INFLIGHT_SUB },
         };
         vk::DescriptorPoolCreateInfo pool_info{
-            .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
-            .maxSets = N_INFLIGHT,
+//            .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+            .maxSets = N_INFLIGHT_SUB,
             .poolSizeCount = (uint32_t)IM_COUNTOF(pool_sizes),
             .pPoolSizes = pool_sizes
         };
         pool = device.createDescriptorPool(pool_info);
 
-        std::vector<vk::DescriptorSetLayout> layouts(N_INFLIGHT, layout);
+        std::vector<vk::DescriptorSetLayout> layouts(N_INFLIGHT_SUB, layout);
         vk::DescriptorSetAllocateInfo alloc_info{
             .descriptorPool = pool, // The pool we just created
-            .descriptorSetCount = N_INFLIGHT,
+            .descriptorSetCount = N_INFLIGHT_SUB,
             .pSetLayouts = layouts.data() // Your predefined VkDescriptorSetLayout
         };
-        auto sets = device.allocateDescriptorSets(alloc_info);
+        auto sets = (*device).allocateDescriptorSets(alloc_info);
 
         vk::CommandPoolCreateInfo poolInfo = {
-            .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+            .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer | vk::CommandPoolCreateFlagBits::eTransient,
             .queueFamilyIndex = queueIndex
         };
         commandPool = device.createCommandPool(poolInfo);
@@ -177,19 +177,19 @@ public:
         vk::CommandBufferAllocateInfo allocInfo = {
             .commandPool = commandPool,
             .level = vk::CommandBufferLevel::ePrimary,
-            .commandBufferCount = N_INFLIGHT
+            .commandBufferCount = N_INFLIGHT_SUB
         };
-        auto commandBuffers = device.allocateCommandBuffers(allocInfo);
+        auto commandBuffers = (*device).allocateCommandBuffers(allocInfo);
 
         vk::FenceCreateInfo fence_info = {
             .flags = vk::FenceCreateFlagBits::eSignaled,
         };
 
-        for (auto i = 0; i < N_INFLIGHT; i++) {
+        for (auto i = 0; i < N_INFLIGHT_SUB; i++) {
             data.push_back({
                 .copyFence = device.createFence(fence_info),
-                .set = std::move(sets[i]),
-                .commandBuffer = std::move(commandBuffers[i]),
+                .set = sets[i],
+                .commandBuffer = commandBuffers[i],
             });
         }
 
@@ -226,6 +226,8 @@ public:
                 (char*)subtitle_codec_ctx->subtitle_header, 
                 subtitle_codec_ctx->subtitle_header_size
             );
+
+            commandPool.reset();
 
             return true;
         }
@@ -270,7 +272,7 @@ public:
             ass_flush_events(ass_track);
         
         data[dataIdx].status = DataSet::Discard;
-        auto next_idx = (dataIdx + 1) % N_INFLIGHT;
+        auto next_idx = (dataIdx + 1) % N_INFLIGHT_SUB;
         auto& sd = data[next_idx];
         if (sd.status == DataSet::Upload) {
             sd.status = DataSet::Discard;
@@ -304,7 +306,6 @@ public:
         std::vector<vk::WriteDescriptorSet> descriptorWrites(textureCount + 1);
 
         device.resetFences(*ds.copyFence);
-        ds.commandBuffer.reset();
         vk::CommandBufferBeginInfo begin_info{
             .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit
         };
@@ -389,11 +390,14 @@ public:
         }
 
         ds.commandBuffer.end();
-        vk::SubmitInfo end_info = {
-            .commandBufferCount = 1,
-            .pCommandBuffers = &*ds.commandBuffer
+        vk::CommandBufferSubmitInfo cmd_info{
+            .commandBuffer = ds.commandBuffer,
         };
-        queue.submit(end_info, ds.copyFence);
+        vk::SubmitInfo2 submit_info{
+            .commandBufferInfoCount = 1,
+            .pCommandBufferInfos = &cmd_info,
+        };
+        queue.submit2(submit_info, ds.copyFence);
 
         vk::DescriptorBufferInfo bufInfo{
             .buffer = *ds.buffer,
@@ -413,7 +417,7 @@ public:
         if (!ass_track)
             return;
 
-        auto next_idx = (dataIdx + 1) % N_INFLIGHT;
+        auto next_idx = (dataIdx + 1) % N_INFLIGHT_SUB;
         auto& ds = data[next_idx];
         auto err = device.waitForFences(*ds.copyFence, vk::True, 0);
         if (err != vk::Result::eSuccess)
@@ -480,8 +484,8 @@ public:
         if (err != vk::Result::eSuccess)
             return;
 
-        commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
-        commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0, *ds.set, nullptr);
+        commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+        commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0, ds.set, nullptr);
         commandBuffer.draw(ds.vertices.size() * 6, 1, 0, 0);
     }
 
@@ -493,7 +497,7 @@ public:
     }
 
     bool check_next_frame(double play_time) {
-        auto next_idx = (dataIdx + 1) % N_INFLIGHT;
+        auto next_idx = (dataIdx + 1) % N_INFLIGHT_SUB;
         auto& ad = data[next_idx];
         if (ad.status == DataSet::Upload) {
             if (ad.play_time <= play_time) {
