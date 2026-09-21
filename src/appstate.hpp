@@ -462,9 +462,7 @@ public:
                 set_play_time(play_time);
             }
             if (data.frame == nullptr || frame_time <= play_time) {
-                if (data.frame)
-                    ff::frame_recycle(data.frame);
-                data.frame = frame;
+                data.frame.reset(frame);
                 data.play_time = frame_time;
                 video.video_frame_queue.pop();
             } else {

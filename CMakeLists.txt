@@ -33,15 +33,10 @@ set(SHADER_SOURCES
     shaders/ass.frag
     shaders/rgb.frag
     shaders/nv12.frag
-    shaders/yuv.frag
-    shaders/yuv_10.frag
     shaders/gray.frag
-    shaders/pal8.frag
     shaders/bitmap.vert
     shaders/bitmap.frag
     shaders/yuyv.frag
-    shaders/ya.frag
-    shaders/yuva.frag
 )
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -86,9 +81,9 @@ target_include_directories(my_imgui PUBLIC
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
 )
-target_link_libraries(my_imgui PRIVATE SDL3::SDL3)
+target_link_libraries(my_imgui PRIVATE SDL3::SDL3 Vulkan::Vulkan)
 
-add_executable(main WIN32
+add_executable(main 
     src/main.cpp
 )
 add_dependencies(main CompileShaders)
@@ -110,4 +105,6 @@ target_link_libraries(main PRIVATE
     PkgConfig::FFMPEG
     PkgConfig::LIBASS
 #    Fontconfig::Fontconfig
+    $<$<PLATFORM_ID:Windows>:d3d11>
+#    $<$<PLATFORM_ID:Windows>:stdc++exp>
 )

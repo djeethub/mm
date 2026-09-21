@@ -13,6 +13,8 @@ extern "C" {
 #include <libavutil/dict.h>
 }
 
+#include "vk_util.hpp"
+
 #include "concurrentqueue.h"
 #include "readerwriterqueue.h"
 
@@ -149,6 +151,9 @@ class VideoFile {
 public:
     VideoFile() {
         _video = this;
+#ifndef NDEBUG
+        av_log_set_level(AV_LOG_VERBOSE);
+#endif
     }
     ~VideoFile() {
         close();
@@ -348,10 +353,53 @@ public:
                 video_codec_ctx->hw_device_ctx = hw_device_ctx;
             }
 #else
-            AVBufferRef *hw_device_ctx = nullptr;
-            if (av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_D3D11VA, NULL, NULL, 0) == 0) {
-                video_codec_ctx->hw_device_ctx = hw_device_ctx;
+            ID3D11Device *d3d11_device = ::d3d11_device.get();
+            ID3D11DeviceContext *d3d11_context = ::d3d11_context.get();
+            if (!d3d11_device) {
+                D3D_FEATURE_LEVEL featureLevels[] = {
+                    D3D_FEATURE_LEVEL_11_1,
+                    D3D_FEATURE_LEVEL_11_0
+                };
+                D3D_FEATURE_LEVEL selectedFeatureLevel;
+
+                // 2. Ensure BGRA/Sharing support is active via creation flags
+                UINT creationFlags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+
+                HRESULT hr = D3D11CreateDevice(
+                    nullptr,                    // Use default adapter (or your matched Vulkan GPU LUID adapter)
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    nullptr,
+                    creationFlags,
+                    featureLevels,
+                    2,                          // Array size
+                    D3D11_SDK_VERSION,
+                    &d3d11_device,
+                    &selectedFeatureLevel,
+                    &d3d11_context
+                );
+                if (selectedFeatureLevel < D3D_FEATURE_LEVEL_11_1) {
+                    // NT Handles and 10-bit AV1 zero-copy configurations may fail on this hardware/driver level
+                }            
+
+                ::d3d11_device.reset(d3d11_device);
+                ::d3d11_context.reset(d3d11_context);
             }
+
+            AVBufferRef* hw_device_ctx = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
+            AVHWDeviceContext* device_ctx = (AVHWDeviceContext*)hw_device_ctx->data;
+            AVD3D11VADeviceContext* d3d11_ctx = (AVD3D11VADeviceContext*)device_ctx->hwctx;
+
+            d3d11_device->AddRef();
+            d3d11_context->AddRef();
+            d3d11_ctx->device         = d3d11_device; // Still pass your healthy shared device
+            d3d11_ctx->device_context = d3d11_context;
+
+            // Do NOT set MiscFlags or BindFlags here. Let FFmpeg handle it safely.
+
+            if (av_hwdevice_ctx_init(hw_device_ctx) == 0) {
+                video_codec_ctx->hw_device_ctx = hw_device_ctx;
+            } else
+                av_buffer_unref(&hw_device_ctx);
 #endif
         }
         video_codec_ctx->thread_count = 0;
@@ -571,7 +619,18 @@ public:
                                 set_seeking(false);
                             }
                             auto new_frame = frame_alloc();
+#ifdef _TEST                            
+                            if (frame->hw_frames_ctx) {
+                                auto err = av_hwframe_transfer_data(new_frame, frame, 0);
+                                if (err) av_err_log("av_hwframe_transfer_data", err);
+                                av_frame_copy_props(new_frame, frame);
+                            }
+                            else {
+                                av_frame_move_ref(new_frame, frame);
+                            }
+#else
                             av_frame_move_ref(new_frame, frame);
+#endif
                             video_frame_queue.enqueue(new_frame);
                         }
                         av_frame_unref(frame);

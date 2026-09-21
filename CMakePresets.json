@@ -40,7 +40,8 @@
       },
       "environment": {
         "PKG_CONFIG_PATH": "C:/Apps/msys64/ucrt64/lib/pkgconfig;C:/Apps/msys64/usr/local/lib/pkgconfig",
-        "PATH": "C:/Apps/msys64/ucrt64/bin;C:/Apps/msys64/usr/local/bin;C:/Apps/local/bin;C:/Program Files/Git/usr/bin;$penv{PATH}"
+        "PATH": "C:/Apps/msys64/ucrt64/bin;C:/Apps/msys64/usr/local/bin;C:/Apps/local/bin;C:/Program Files/Git/usr/bin;$penv{PATH}",
+        "VK_LAYER_PATH": "C:/Apps/msys64/ucrt64/bin/VkLayer_khronos_validation.json"
       }
     },
     {

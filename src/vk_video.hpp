@@ -36,43 +36,22 @@ struct Uniforms
 	float tex_size[2]; // width, height of Y plane
 };
 
-struct AvFrameData {
-    AVFrame *frame = nullptr;
-    AVFrame *mapped = nullptr;
-    double play_time;
-
-    // 1. Non-copyable (or implement deep copy if you really need it)
-    AvFrameData() {}
-    AvFrameData(const AvFrameData&)            = delete;
-    AvFrameData& operator=(const AvFrameData&) = delete;
-
-    // 2. Move constructor / move assignment that *transfer* ownership
-    AvFrameData(AvFrameData&& other) noexcept
-        : frame(std::exchange(other.frame, nullptr)),
-          mapped(std::exchange(other.mapped, nullptr)),
-          play_time(other.play_time)
-    {}
-
-    AvFrameData& operator=(AvFrameData&& other) noexcept {
-        if (this != &other) {
-            // release what we currently own
-            ff::frame_recycle(mapped);
-            ff::frame_recycle(frame);
-
-            // steal
-            frame     = std::exchange(other.frame, nullptr);
-            mapped    = std::exchange(other.mapped, nullptr);
-            play_time = other.play_time;
-        }
-        return *this;
-    }
-
-    ~AvFrameData() {
-        ff::frame_recycle(mapped);
+struct AvFrameDeleter {
+    void operator()(AVFrame *frame) const {
         ff::frame_recycle(frame);
     }
 };
 
+struct AvFrameData {
+    std::unique_ptr<AVFrame, AvFrameDeleter> frame;
+    double play_time;
+};
+#ifdef _WIN32
+struct D3D11Data {
+    std::unique_ptr<ID3D11Texture2D, D3Deleter<ID3D11Texture2D>> tex;
+    std::unique_ptr<IDXGIKeyedMutex, D3Deleter<IDXGIKeyedMutex>> mutex;
+};
+#endif
 struct VkFrame {
     enum Status {
         None,
@@ -92,6 +71,11 @@ struct VkFrame {
     vk::CommandBuffer commandBuffer = nullptr;
 
     AvFrameData frame_data;
+#ifdef __linux__
+    std::unique_ptr<AVFrame, AvFrameDeleter> mapped;
+#else
+    D3D11Data mapped;
+#endif
     Status status = None;
 };
 
@@ -115,51 +99,84 @@ private:
     SwsContext *sws_ctx = nullptr;
 
     void init_frame(int idx, const AVFrame *frame, const vk::raii::Device& device) {
-        auto& x = frames[idx];
+        auto& vf = frames[idx];
 
         if (frame->hw_frames_ctx) {
-        } else {
-            vk::ImageCreateInfo info{
+#ifdef _WIN32
+            // 1. Get the texture handles from the incoming AVFrame
+            ID3D11Texture2D* decoder_texture = (ID3D11Texture2D*)frame->data[0];
+            ID3D11Texture2D* d3d11_texture = nullptr;
+            D3D11_TEXTURE2D_DESC decoded_desc{};
+            decoder_texture->GetDesc(&decoded_desc);
+
+            D3D11_TEXTURE2D_DESC desc{
+                .Width = (UINT) width,
+                .Height = (UINT) height,
+                .MipLevels = 1,
+                .ArraySize = 1,
+                .Format = decoded_desc.Format,
+                .SampleDesc = {
+                    .Count = 1,
+                },
+                .Usage = D3D11_USAGE_DEFAULT,
+                .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
+                .MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
+            };
+            HRESULT hr = d3d11_device->CreateTexture2D(&desc, nullptr, &d3d11_texture);
+            if (hr != S_OK)
+                throw std::runtime_error("CreateTexture2D failed.");
+
+            IDXGIKeyedMutex* d3d11_keyed_mutex = nullptr;
+            d3d11_texture->QueryInterface(IID_PPV_ARGS(&d3d11_keyed_mutex));
+
+            vf.mapped.tex.reset(d3d11_texture);
+            vf.mapped.mutex.reset(d3d11_keyed_mutex);
+
+            // Export the handle to Vulkan now!
+            IDXGIResource1* dxgi_res = nullptr;
+            d3d11_texture->QueryInterface(IID_PPV_ARGS(&dxgi_res));
+            HANDLE shared_texture_handle = nullptr;
+            hr = dxgi_res->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ, nullptr, &shared_texture_handle);
+            dxgi_res->Release();
+
+            vk::ExternalMemoryImageCreateInfo external_image_info{
+                .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eD3D11Texture, // or KMT depending on allocation
+            };
+            vk::ImageCreateInfo image_info{
+                .pNext = &external_image_info,
                 .imageType = vk::ImageType::e2D,
                 .format = format,
-                .extent = { .width = (uint32_t) frame->width, .height = (uint32_t) frame->height, .depth = 1 },
+                .extent = { .width = (uint32_t) width, .height = (uint32_t) height, .depth = 1 },
                 .mipLevels = 1,
                 .arrayLayers = 1,
                 .samples = vk::SampleCountFlagBits::e1,
                 .tiling = vk::ImageTiling::eOptimal,
-                .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
-                .sharingMode = vk::SharingMode::eExclusive,
-                .initialLayout = vk::ImageLayout::eUndefined,
+                .usage = vk::ImageUsageFlagBits::eSampled,
+//                .sharingMode = vk::SharingMode::eExclusive,
             };
-            x.image = device.createImage(info);
-            auto req = x.image.getMemoryRequirements();
+            vf.image = device.createImage(image_info);
+
+            vk::MemoryDedicatedAllocateInfo dedicatedAllocInfo{
+                .image = vf.image,
+                .buffer = nullptr,
+            };
+            vk::ImportMemoryWin32HandleInfoKHR memory_import{
+                .pNext = &dedicatedAllocInfo,
+                .handleType = vk::ExternalMemoryHandleTypeFlagBits::eD3D11Texture,
+                .handle = shared_texture_handle
+            };
+            auto req = vf.image.getMemoryRequirements();
             vk::MemoryAllocateInfo mem_alloc_info{
+                .pNext = &memory_import,
                 .allocationSize = req.size,
                 .memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal)
             };
-            x.memory = device.allocateMemory(mem_alloc_info);
-            x.image.bindMemory(x.memory, 0);
-
-            // Create the Upload Buffer:
-            upload_size = get_upload_size();
-            {
-                vk::BufferCreateInfo buffer_info = {
-                    .size = upload_size,
-                    .usage = vk::BufferUsageFlagBits::eTransferSrc,
-                    .sharingMode = vk::SharingMode::eExclusive
-                };
-                x.upload_buffer = device.createBuffer(buffer_info);
-                auto req = x.upload_buffer.getMemoryRequirements();
-                vk::MemoryAllocateInfo alloc_info = {
-                    .allocationSize = req.size,
-                    .memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)
-                };
-                x.upload_buffer_memory = device.allocateMemory(alloc_info);
-                x.upload_buffer.bindMemory(x.upload_buffer_memory, 0);
-            }
+            vf.memory = device.allocateMemory(mem_alloc_info);
+            vf.image.bindMemory(vf.memory, 0);
+            CloseHandle(shared_texture_handle);
 
             vk::ImageViewCreateInfo viewInfo{
-                .image = x.image,     // The VkImage containing your uploaded AVFrame data
+                .image = vf.image,     // The VkImage containing your uploaded AVFrame data
                 .viewType = vk::ImageViewType::e2D,
                 .format = format,
                 .subresourceRange = {
@@ -179,12 +196,87 @@ private:
             } else {
                 imageInfo.sampler = sampler;
             }
-            x.imageView = device.createImageView(viewInfo);
-            imageInfo.imageView = x.imageView;
+            vf.imageView = device.createImageView(viewInfo);
+            
+            imageInfo.imageView = vf.imageView;
+            vk::WriteDescriptorSet descriptorWrites[] = {
+                {
+                    .dstSet = vf.set,
+                    .dstBinding = 0,
+                    .descriptorCount = 1,
+                    .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                    .pImageInfo = &imageInfo,
+                },
+            };
+            device.updateDescriptorSets(descriptorWrites, nullptr);
+#endif
+        } else {
+            vk::ImageCreateInfo info{
+                .imageType = vk::ImageType::e2D,
+                .format = format,
+                .extent = { .width = (uint32_t) frame->width, .height = (uint32_t) frame->height, .depth = 1 },
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = vk::SampleCountFlagBits::e1,
+                .tiling = vk::ImageTiling::eOptimal,
+                .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
+                .sharingMode = vk::SharingMode::eExclusive,
+                .initialLayout = vk::ImageLayout::eUndefined,
+            };
+            vf.image = device.createImage(info);
+            auto req = vf.image.getMemoryRequirements();
+            vk::MemoryAllocateInfo mem_alloc_info{
+                .allocationSize = req.size,
+                .memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal)
+            };
+            vf.memory = device.allocateMemory(mem_alloc_info);
+            vf.image.bindMemory(vf.memory, 0);
+
+            // Create the Upload Buffer:
+            upload_size = get_upload_size();
+            {
+                vk::BufferCreateInfo buffer_info = {
+                    .size = upload_size,
+                    .usage = vk::BufferUsageFlagBits::eTransferSrc,
+                    .sharingMode = vk::SharingMode::eExclusive
+                };
+                vf.upload_buffer = device.createBuffer(buffer_info);
+                auto req = vf.upload_buffer.getMemoryRequirements();
+                vk::MemoryAllocateInfo alloc_info = {
+                    .allocationSize = req.size,
+                    .memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)
+                };
+                vf.upload_buffer_memory = device.allocateMemory(alloc_info);
+                vf.upload_buffer.bindMemory(vf.upload_buffer_memory, 0);
+            }
+
+            vk::ImageViewCreateInfo viewInfo{
+                .image = vf.image,     // The VkImage containing your uploaded AVFrame data
+                .viewType = vk::ImageViewType::e2D,
+                .format = format,
+                .subresourceRange = {
+                    .aspectMask = vk::ImageAspectFlagBits::eColor, // Vulkan handles sub-planes internally
+                    .levelCount = 1,
+                    .layerCount = 1
+                },
+            };
+            vk::DescriptorImageInfo imageInfo{
+                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+            };
+            vk::SamplerYcbcrConversionInfo viewConversionInfo{
+            };
+            if (*ycbcrConversion) {
+                viewConversionInfo.conversion = ycbcrConversion;
+                viewInfo.pNext = &viewConversionInfo; // <-- Crucial!
+            } else {
+                imageInfo.sampler = sampler;
+            }
+            vf.imageView = device.createImageView(viewInfo);
+            imageInfo.imageView = vf.imageView;
 
             vk::WriteDescriptorSet descriptorWrites[] = {
                 {
-                    .dstSet = x.set,
+                    .dstSet = vf.set,
                     .dstBinding = 0,
                     .descriptorCount = 1,
                     .descriptorType = vk::DescriptorType::eCombinedImageSampler,
@@ -194,7 +286,7 @@ private:
             device.updateDescriptorSets(descriptorWrites, nullptr);
         }
 
-        x.status = VkFrame::New;
+        vf.status = VkFrame::New;
     }
 
     int get_upload_size() {
@@ -434,10 +526,11 @@ public:
         bool canUseYcbcr = (features & vk::FormatFeatureFlagBits::eSampledImageYcbcrConversionLinearFilter) &&
                         ((features & vk::FormatFeatureFlagBits::eMidpointChromaSamples) || 
                             (features & vk::FormatFeatureFlagBits::eCositedChromaSamples));
+        bool canLinear = (bool) (features & vk::FormatFeatureFlagBits::eSampledImageFilterLinear);
 
         vk::SamplerCreateInfo samplerInfo{
-            .magFilter = vk::Filter::eLinear,
-            .minFilter = vk::Filter::eLinear,
+            .magFilter = canLinear ? vk::Filter::eLinear : vk::Filter::eNearest,
+            .minFilter = canLinear ? vk::Filter::eLinear : vk::Filter::eNearest,
         // Address modes must be CLAMP_TO_EDGE for YUV samplers
             .addressModeU = vk::SamplerAddressMode::eClampToEdge,
             .addressModeV = vk::SamplerAddressMode::eClampToEdge,
@@ -612,8 +705,9 @@ public:
     }
 
     void upmap(VkFrame& vf, const vk::raii::Device& device, const vk::raii::Queue& queue) {
-        auto frame = vf.frame_data.frame;
+        auto frame = vf.frame_data.frame.get();
 
+#ifdef __linux__
         AVFrame *drm_frame = ff::frame_alloc();
         // Map VAAPI surface to DRM PRIME
         drm_frame->format = AV_PIX_FMT_DRM_PRIME;
@@ -623,7 +717,7 @@ public:
             std::println("av_hwframe_map failed.");
             return;
         }
-        vf.frame_data.mapped = drm_frame;
+        vf.mapped.reset(drm_frame);
 
         // drm_frame->data[0] now contains a pointer to an AVDRMFrameDescriptor struct
         AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)drm_frame->data[0];
@@ -715,7 +809,6 @@ public:
         }
         vf.imageView = device.createImageView(viewInfo);
         imageInfo.imageView = vf.imageView;
-
         vk::WriteDescriptorSet descriptorWrites[] = {
             {
                 .dstSet = vf.set,
@@ -726,6 +819,78 @@ public:
             },
         };
         device.updateDescriptorSets(descriptorWrites, nullptr);
+#else
+        ID3D11Texture2D* decoder_texture = (ID3D11Texture2D*)frame->data[0];
+        UINT texture_slice_index = (UINT)(intptr_t)frame->data[1];
+
+        D3D11_BOX sourceBox{
+            .right = (UINT) width,
+            .bottom = (UINT) height,
+            .back = 1
+        };
+
+        HRESULT hr = vf.mapped.mutex->AcquireSync(0, INFINITE);
+        d3d11_context->CopySubresourceRegion(
+            vf.mapped.tex.get(), 0,        // Destination texture and subresource slice index
+            0, 0, 0,                         // Destination coordinates (X, Y, Z)
+            decoder_texture, texture_slice_index, // Source texture array pointer and matching active frame slice
+            &sourceBox                          // Source box wrapper pointer (nullptr = Copy entire plane layout)
+        );
+        d3d11_context->Flush(); 
+        vf.mapped.mutex->ReleaseSync(1);
+
+        device.resetFences(*vf.copyFence);
+        vk::CommandBufferBeginInfo begin_info{
+            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit
+        };        
+        vf.commandBuffer.begin(begin_info);
+        
+        vk::ImageMemoryBarrier2 imageBarrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eNone,
+            .srcAccessMask = vk::AccessFlagBits2::eNone,
+            .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
+            .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
+            .image = *vf.image,
+            .subresourceRange = {
+                .aspectMask = vk::ImageAspectFlags::BitsType::eColor,
+                .levelCount = 1,
+                .layerCount = 1,
+            },
+        };
+        vk::DependencyInfo dep_info = {
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &imageBarrier
+        };
+        vf.commandBuffer.pipelineBarrier2(dep_info);
+
+        vf.commandBuffer.end();
+
+        uint64_t acquireKey = 1;
+        uint64_t releaseKey = 0;
+        uint32_t timeoutMs  = INFINITE;
+        vk::Win32KeyedMutexAcquireReleaseInfoKHR keyedMutexInfo{
+            .acquireCount = 1,
+            .pAcquireSyncs = &*vf.memory,
+            .pAcquireKeys = &acquireKey,
+            .pAcquireTimeouts = &timeoutMs,
+            .releaseCount = 1,
+            .pReleaseSyncs = &*vf.memory,
+            .pReleaseKeys = &releaseKey,
+        };
+        vk::CommandBufferSubmitInfo cmd_info{
+            .commandBuffer = vf.commandBuffer,
+        };
+        vk::SubmitInfo2 submit_info{
+            .pNext = &keyedMutexInfo,
+            .commandBufferInfoCount = 1,
+            .pCommandBufferInfos = &cmd_info,
+        };
+        queue.submit2(submit_info, vf.copyFence);
+#endif
         
         vf.status = VkFrame::Upload;
     }
@@ -739,7 +904,7 @@ public:
         }
 
         vf.frame_data = std::move(frame_data);
-        AVFrame *frame = vf.frame_data.frame;
+        AVFrame *frame = vf.frame_data.frame.get();
         if (frame->hw_frames_ctx) {
             upmap(vf, device, queue);
             return;

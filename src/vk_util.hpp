@@ -3,10 +3,34 @@
 #define VULKAN_HPP_NO_STRUCT_CONSTRUCTORS
 #include <vulkan/vulkan_raii.hpp>
 
+#ifdef __linux__
+extern "C" {
+#include <libavutil/hwcontext_drm.h>
+}
+#else
+extern "C" {
+#include <libavutil/hwcontext_d3d11va.h>
+}
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#endif
+
+template <typename T>
+struct D3Deleter {
+    void operator()(T *t) const {
+        t->Release();
+    }
+};
+
 vk::PhysicalDeviceMemoryProperties memProperties;
 vk::SurfaceFormatKHR swapChainSurfaceFormat;
 vk::Extent2D swapChainExtent;
 uint32_t queueIndex     = ~0;
+
+#ifdef _WIN32
+std::unique_ptr<ID3D11Device, D3Deleter<ID3D11Device>> d3d11_device;
+std::unique_ptr<ID3D11DeviceContext, D3Deleter<ID3D11DeviceContext>> d3d11_context;
+#endif
 
 inline uint32_t findMemoryType(uint32_t typeFilter, vk::MemoryPropertyFlags properties) {
     for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {

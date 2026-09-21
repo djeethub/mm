@@ -5,10 +5,6 @@
 #include "vk_util.hpp"
 #include <SDL3/SDL_vulkan.h>
 
-extern "C" {
-#include <libavutil/hwcontext_drm.h>
-}
-
 #include "vk_video.hpp"
 #include "subtitle.hpp"
 
@@ -34,7 +30,11 @@ void check_vk_result(VkResult err)
 
 static VKAPI_ATTR vk::Bool32 VKAPI_CALL debugCallback(vk::DebugUtilsMessageSeverityFlagBitsEXT severity, vk::DebugUtilsMessageTypeFlagsEXT type, const vk::DebugUtilsMessengerCallbackDataEXT *pCallbackData, void *)
 {
+#ifdef __linux__	
     std::println("[Vulkan {}] {}", to_string(type), pCallbackData->pMessage);
+#else
+	SDL_Log("[Vulkan %s] %s\n", to_string(type).c_str(), pCallbackData->pMessage);
+#endif
     return vk::False;
 }
 
@@ -42,10 +42,14 @@ class AppVk {
 private:
 	std::vector<const char *> requiredDeviceExtension = {
 	    vk::KHRSwapchainExtensionName,
+		vk::KHRExternalMemoryExtensionName,
+#ifdef __linux__
 		vk::EXTExternalMemoryDmaBufExtensionName,
 		vk::EXTImageDrmFormatModifierExtensionName,
-		vk::KHRExternalMemoryExtensionName,
 		vk::KHRExternalMemoryFdExtensionName,
+#else
+		vk::KHRExternalMemoryWin32ExtensionName,
+#endif
 	};
 
     vk::raii::Context context;
@@ -535,10 +539,10 @@ public:
     }
 
     void set_frame(AvFrameData frame_data, AppSub sub) {
-        if (!video.check_frame(frame_data.frame))
+        if (!video.check_frame(frame_data.frame.get()))
 		{
 			device.waitIdle();
-		    video.init(frame_data.frame, physicalDevice, device);
+		    video.init(frame_data.frame.get(), physicalDevice, device);
 			reset_scale();
 		}
         video.upload(std::move(frame_data), device, queue);

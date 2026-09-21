@@ -1,3 +1,7 @@
+#define VULKAN_HPP_NO_STRUCT_CONSTRUCTORS
+#ifdef _WIN32
+#define VK_USE_PLATFORM_WIN32_KHR
+#endif
 #define SDL_MAIN_USE_CALLBACKS 1
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
