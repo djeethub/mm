@@ -83,8 +83,11 @@ target_include_directories(my_imgui PUBLIC
 )
 target_link_libraries(my_imgui PRIVATE SDL3::SDL3 Vulkan::Vulkan)
 
-add_executable(main 
+add_executable(main
     src/main.cpp
+)
+set_target_properties(main PROPERTIES 
+    WIN32_EXECUTABLE $<CONFIG:Release>
 )
 add_dependencies(main CompileShaders)
 

@@ -145,14 +145,11 @@ inline void subtitle_recycle(AVSubtitle_ *frame) {
     sub_pool.recycle(frame);
 }
 
-class VideoFile *_video;
-
 class VideoFile {
 public:
     VideoFile() {
-        _video = this;
 #ifndef NDEBUG
-        av_log_set_level(AV_LOG_VERBOSE);
+        av_log_set_level(AV_LOG_WARNING);
 #endif
     }
     ~VideoFile() {
@@ -217,6 +214,14 @@ public:
         if (!frame) frame = frame_pool.alloc();
         last_audio_time = start_time;
         last_video_time = start_time;
+        audio_stream_index = -1;
+        video_stream_index = -1;
+        subtitle_stream_idx = -1;
+        subtitle_list.clear();
+        audio_list.clear();
+        is_seeking = false;
+        video_available = false;
+        is_eof.store(false, std::memory_order_relaxed);
         return true;
     }
 
@@ -344,6 +349,46 @@ public:
         return true;
     }
 
+#ifdef _WIN32
+    static enum AVPixelFormat negotiate_hw_format(AVCodecContext* ctx, const enum AVPixelFormat* choices) {
+        const enum AVPixelFormat target_format = AV_PIX_FMT_D3D11;
+        
+        for (const enum AVPixelFormat* p = choices; *p != AV_PIX_FMT_NONE; p++) {
+            if (*p == target_format) {
+                // 1. Manually build the hardware frame configuration blueprint
+                AVBufferRef* hw_frames_ref = nullptr;
+                auto err = avcodec_get_hw_frames_parameters(ctx, ctx->hw_device_ctx, target_format, &hw_frames_ref);
+                if (!hw_frames_ref) {
+                    // Failed to create configuration blueprints, fallback
+                    break; 
+                }
+                
+                // 2. Safely grab the context (this will no longer be nullptr!)
+                AVHWFramesContext* hw_frames = (AVHWFramesContext*)hw_frames_ref->data;
+                
+                // 3. Inject our cross-API shared handles instruction layers
+                AVD3D11VAFramesContext* d3d11_frames = (AVD3D11VAFramesContext*)hw_frames->hwctx;
+                d3d11_frames->MiscFlags |= D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+//                d3d11_frames->BindFlags = D3D11_BIND_DECODER;
+                
+                // 4. Fire the frame pool allocator using your custom parameters
+                err = av_hwframe_ctx_init(hw_frames_ref);
+                if (err < 0) {
+                    av_buffer_unref(&hw_frames_ref);
+                    break;
+                }
+                
+                // 5. Hand the finalized, cross-API ready texture pool to the codec
+                ctx->hw_frames_ctx = hw_frames_ref; // Passes ownership to ctx
+                return target_format;
+            }
+        }
+        
+        // Fallback if D3D11 fails to spin up
+        return avcodec_default_get_format(ctx, choices);
+    }
+#endif
+
     bool open_video_decoder(const AVCodecParameters *codec_params, const AVCodec *codec, bool hwdec) {
         video_codec_ctx = avcodec_alloc_context3(codec);
         if (hwdec) {
@@ -353,53 +398,25 @@ public:
                 video_codec_ctx->hw_device_ctx = hw_device_ctx;
             }
 #else
-            ID3D11Device *d3d11_device = ::d3d11_device.get();
-            ID3D11DeviceContext *d3d11_context = ::d3d11_context.get();
-            if (!d3d11_device) {
-                D3D_FEATURE_LEVEL featureLevels[] = {
-                    D3D_FEATURE_LEVEL_11_1,
-                    D3D_FEATURE_LEVEL_11_0
-                };
-                D3D_FEATURE_LEVEL selectedFeatureLevel;
+            init_d3d();
+            if (d3d11_device) {
+                AVBufferRef* hw_device_ctx = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
+                AVHWDeviceContext* device_ctx = (AVHWDeviceContext*)hw_device_ctx->data;
+                AVD3D11VADeviceContext* d3d11_ctx = (AVD3D11VADeviceContext*)device_ctx->hwctx;
 
-                // 2. Ensure BGRA/Sharing support is active via creation flags
-                UINT creationFlags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+                d3d11_device->AddRef();
+                d3d11_context->AddRef();
+                d3d11_ctx->device         = d3d11_device.get(); // Still pass your healthy shared device
+                d3d11_ctx->device_context = d3d11_context.get();
 
-                HRESULT hr = D3D11CreateDevice(
-                    nullptr,                    // Use default adapter (or your matched Vulkan GPU LUID adapter)
-                    D3D_DRIVER_TYPE_HARDWARE,
-                    nullptr,
-                    creationFlags,
-                    featureLevels,
-                    2,                          // Array size
-                    D3D11_SDK_VERSION,
-                    &d3d11_device,
-                    &selectedFeatureLevel,
-                    &d3d11_context
-                );
-                if (selectedFeatureLevel < D3D_FEATURE_LEVEL_11_1) {
-                    // NT Handles and 10-bit AV1 zero-copy configurations may fail on this hardware/driver level
-                }            
+                // Do NOT set MiscFlags or BindFlags here. Let FFmpeg handle it safely.
 
-                ::d3d11_device.reset(d3d11_device);
-                ::d3d11_context.reset(d3d11_context);
+                if (av_hwdevice_ctx_init(hw_device_ctx) == 0) {
+                    video_codec_ctx->hw_device_ctx = hw_device_ctx;
+                    video_codec_ctx->get_format = negotiate_hw_format;
+                } else
+                    av_buffer_unref(&hw_device_ctx);
             }
-
-            AVBufferRef* hw_device_ctx = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
-            AVHWDeviceContext* device_ctx = (AVHWDeviceContext*)hw_device_ctx->data;
-            AVD3D11VADeviceContext* d3d11_ctx = (AVD3D11VADeviceContext*)device_ctx->hwctx;
-
-            d3d11_device->AddRef();
-            d3d11_context->AddRef();
-            d3d11_ctx->device         = d3d11_device; // Still pass your healthy shared device
-            d3d11_ctx->device_context = d3d11_context;
-
-            // Do NOT set MiscFlags or BindFlags here. Let FFmpeg handle it safely.
-
-            if (av_hwdevice_ctx_init(hw_device_ctx) == 0) {
-                video_codec_ctx->hw_device_ctx = hw_device_ctx;
-            } else
-                av_buffer_unref(&hw_device_ctx);
 #endif
         }
         video_codec_ctx->thread_count = 0;
@@ -451,14 +468,6 @@ public:
         avcodec_free_context(&video_codec_ctx);
         avcodec_free_context(&subtitle_codec_ctx);
         avformat_close_input(&format_ctx);
-        audio_stream_index = -1;
-        video_stream_index = -1;
-        subtitle_stream_idx = -1;
-        subtitle_list.clear();
-        audio_list.clear();
-        is_seeking = false;
-        video_available = false;
-        is_eof.store(false, std::memory_order_relaxed);
     }
 
     void get_video_dimensions(int& width, int& height) const {
@@ -747,5 +756,62 @@ private:
     std::thread thread;
     double last_video_time;
     double last_audio_time;
+
+#ifdef _WIN32
+    std::unique_ptr<ID3D11Device, D3Deleter<ID3D11Device>> d3d11_device;
+    std::unique_ptr<ID3D11DeviceContext, D3Deleter<ID3D11DeviceContext>> d3d11_context;
+
+    void init_d3d() {
+        ID3D11Device *d3d11_device = this->d3d11_device.get();
+        ID3D11DeviceContext *d3d11_context = this->d3d11_context.get();
+        if (!d3d11_device) {
+            D3D_FEATURE_LEVEL featureLevels[] = {
+                D3D_FEATURE_LEVEL_11_1,
+                D3D_FEATURE_LEVEL_11_0
+            };
+            D3D_FEATURE_LEVEL selectedFeatureLevel;
+
+            // 2. Ensure BGRA/Sharing support is active via creation flags
+            UINT creationFlags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+#ifndef NDEBUG
+            creationFlags |= D3D11_CREATE_DEVICE_DEBUG;
+#endif
+            HRESULT hr = D3D11CreateDevice(
+                nullptr,                    // Use default adapter (or your matched Vulkan GPU LUID adapter)
+                D3D_DRIVER_TYPE_HARDWARE,
+                nullptr,
+                creationFlags,
+                featureLevels,
+                2,                          // Array size
+                D3D11_SDK_VERSION,
+                &d3d11_device,
+                &selectedFeatureLevel,
+                &d3d11_context
+            );
+            if (selectedFeatureLevel < D3D_FEATURE_LEVEL_11_1) {
+                // NT Handles and 10-bit AV1 zero-copy configurations may fail on this hardware/driver level
+            }
+#ifndef NDEBUG
+            ID3D11Debug *d3dDebug;
+            if (SUCCEEDED(d3d11_device->QueryInterface(IID_PPV_ARGS(&d3dDebug)))) {
+                ID3D11InfoQueue *infoQueue;
+                if (SUCCEEDED(d3dDebug->QueryInterface(IID_PPV_ARGS(&infoQueue)))) {
+                    // Optional: break on serious problems
+                    infoQueue->SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_CORRUPTION, TRUE);
+                    infoQueue->SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_ERROR, TRUE);
+
+                    // Optional: push an empty filter so nothing is filtered out
+                    infoQueue->PushEmptyStorageFilter();
+                    infoQueue->Release();
+                }
+                d3dDebug->Release();
+            } else {
+            }
+#endif
+            this->d3d11_device.reset(d3d11_device);
+            this->d3d11_context.reset(d3d11_context);
+        }
+    }
+#endif    
 };
 } // namespace ff

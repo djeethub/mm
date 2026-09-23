@@ -49,6 +49,8 @@ private:
 		vk::KHRExternalMemoryFdExtensionName,
 #else
 		vk::KHRExternalMemoryWin32ExtensionName,
+		vk::KHRTimelineSemaphoreExtensionName,
+		vk::KHRExternalSemaphoreWin32ExtensionName,
 #endif
 	};
 
@@ -241,12 +243,13 @@ private:
 		}
 
 		// query for Vulkan 1.3 features
-		vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT, vk::PhysicalDeviceSamplerYcbcrConversionFeatures, vk::PhysicalDeviceDescriptorIndexingFeatures> featureChain = {
+		vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT, vk::PhysicalDeviceSamplerYcbcrConversionFeatures, vk::PhysicalDeviceDescriptorIndexingFeatures, vk::PhysicalDeviceTimelineSemaphoreFeatures> featureChain = {
 		    {.features = {.samplerAnisotropy = true}},                   // vk::PhysicalDeviceFeatures2
 		    {.synchronization2 = true, .dynamicRendering = true},        // vk::PhysicalDeviceVulkan13Features
 		    {.extendedDynamicState = true},                               // vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT
 			{.samplerYcbcrConversion = true},
 			{.shaderSampledImageArrayNonUniformIndexing = true, .runtimeDescriptorArray = true},
+			{.timelineSemaphore = true},
 		};
 
 		// create a Device

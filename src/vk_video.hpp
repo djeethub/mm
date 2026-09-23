@@ -46,12 +46,35 @@ struct AvFrameData {
     std::unique_ptr<AVFrame, AvFrameDeleter> frame;
     double play_time;
 };
+
 #ifdef _WIN32
 struct D3D11Data {
     std::unique_ptr<ID3D11Texture2D, D3Deleter<ID3D11Texture2D>> tex;
-    std::unique_ptr<IDXGIKeyedMutex, D3Deleter<IDXGIKeyedMutex>> mutex;
+    std::unique_ptr<ID3D11Texture2D, D3Deleter<ID3D11Texture2D>> shared_tex;
+    std::unique_ptr<ID3D11Fence, D3Deleter<ID3D11Fence>> fence;
+    vk::raii::Semaphore semaphore = nullptr;
+    uint64_t counter;
 };
+
+void check_d3d_result(HRESULT hr) {
+    if (hr == S_OK)
+        return;
+
+    LPTSTR errorText = nullptr;
+    FormatMessage(
+            FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_IGNORE_INSERTS,
+            NULL,
+            hr,
+            MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+            (LPTSTR)&errorText,
+            0,
+            NULL
+        );        
+    SDL_Log("[D3D %x]: %s\n", hr, errorText);
+//    throw std::runtime_error("D3 Failed.");
+}
 #endif
+
 struct VkFrame {
     enum Status {
         None,
@@ -59,6 +82,7 @@ struct VkFrame {
         Upload,
         Discard,
         Ready,
+        Retry,
     };
 
     vk::raii::Image image = nullptr;
@@ -98,9 +122,7 @@ private:
     bool native = true;
     SwsContext *sws_ctx = nullptr;
 
-    void init_frame(int idx, const AVFrame *frame, const vk::raii::Device& device) {
-        auto& vf = frames[idx];
-
+    void init_frame(VkFrame& vf, const AVFrame *frame, const vk::raii::Device& device) {
         if (frame->hw_frames_ctx) {
 #ifdef _WIN32
             // 1. Get the texture handles from the incoming AVFrame
@@ -119,18 +141,14 @@ private:
                     .Count = 1,
                 },
                 .Usage = D3D11_USAGE_DEFAULT,
-                .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
-                .MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
+//                .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
+                .MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED,
             };
             HRESULT hr = d3d11_device->CreateTexture2D(&desc, nullptr, &d3d11_texture);
             if (hr != S_OK)
                 throw std::runtime_error("CreateTexture2D failed.");
 
-            IDXGIKeyedMutex* d3d11_keyed_mutex = nullptr;
-            d3d11_texture->QueryInterface(IID_PPV_ARGS(&d3d11_keyed_mutex));
-
             vf.mapped.tex.reset(d3d11_texture);
-            vf.mapped.mutex.reset(d3d11_keyed_mutex);
 
             // Export the handle to Vulkan now!
             IDXGIResource1* dxgi_res = nullptr;
@@ -209,6 +227,43 @@ private:
                 },
             };
             device.updateDescriptorSets(descriptorWrites, nullptr);
+
+            if (!vf.mapped.fence) {
+                vf.mapped.counter = 0;
+
+                // 1. Query the 11.3 interface
+                ID3D11Device5* d3d11_device5 = nullptr;
+                d3d11_device->QueryInterface(IID_PPV_ARGS(&d3d11_device5));
+
+                // 2. Create a shareable hardware fence
+                ID3D11Fence* d3d11_fence = nullptr;
+                HRESULT hr = d3d11_device5->CreateFence(
+                    vf.mapped.counter, // Initial fence value
+                    D3D11_FENCE_FLAG_SHARED,
+                    IID_PPV_ARGS(&d3d11_fence)
+                );
+                vf.mapped.fence.reset(d3d11_fence);
+
+                vk::SemaphoreTypeCreateInfo timelineInfo{
+                    .semaphoreType = vk::SemaphoreType::eTimeline,
+                    .initialValue = vf.mapped.counter
+                };
+                vk::SemaphoreCreateInfo semaphoreInfo{
+                    .pNext = &timelineInfo
+                };
+                vf.mapped.semaphore = device.createSemaphore(semaphoreInfo);
+
+                HANDLE shared_fence_handle = nullptr;
+                hr = d3d11_fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &shared_fence_handle);
+                d3d11_device5->Release();
+                vk::ImportSemaphoreWin32HandleInfoKHR importInfo{
+                    .semaphore = vf.mapped.semaphore,
+                    .handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eD3D12Fence, // Same underlying kernel type as D3D11 Fence
+                    .handle = shared_fence_handle,
+                };
+                device.importSemaphoreWin32HandleKHR(importInfo);
+                CloseHandle(shared_fence_handle);
+            }
 #endif
         } else {
             vk::ImageCreateInfo info{
@@ -404,6 +459,9 @@ public:
             // Access the frame context structural layer
             AVHWFramesContext *hwfc = (AVHWFramesContext*)frame->hw_frames_ctx->data;
             pix_fmt = hwfc->sw_format;
+#ifdef _WIN32
+            init_d3d();
+#endif
         } else {
             pix_fmt = (AVPixelFormat) frame->format;
         }
@@ -608,7 +666,7 @@ public:
 
         for (auto i = 0; i < N_INFLIGHT_VIDEO; i++) {
             frames[i].set = sets[i];
-            init_frame(i, frame, device);
+            init_frame(frames[i], frame, device);
         }
 
         createGraphicsPipeline(device);
@@ -820,8 +878,23 @@ public:
         };
         device.updateDescriptorSets(descriptorWrites, nullptr);
 #else
+        HRESULT hr;
         ID3D11Texture2D* decoder_texture = (ID3D11Texture2D*)frame->data[0];
         UINT texture_slice_index = (UINT)(intptr_t)frame->data[1];
+
+        IDXGIResource1* dxgi_res = nullptr;
+        decoder_texture->QueryInterface(IID_PPV_ARGS(&dxgi_res));
+        HANDLE shared_texture_handle = nullptr;
+        hr = dxgi_res->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ, nullptr, &shared_texture_handle);
+        dxgi_res->Release();
+
+        ID3D11Texture2D* shared_tex = nullptr;
+        ID3D11Device1 *d3d11_device1 = nullptr;
+        hr = d3d11_device->QueryInterface(IID_PPV_ARGS(&d3d11_device1));
+        d3d11_device1->OpenSharedResource1(shared_texture_handle, IID_PPV_ARGS(&shared_tex));
+        vf.mapped.shared_tex.reset(shared_tex);
+        d3d11_device1->Release();
+        CloseHandle(shared_texture_handle);
 
         D3D11_BOX sourceBox{
             .right = (UINT) width,
@@ -829,15 +902,18 @@ public:
             .back = 1
         };
 
-        HRESULT hr = vf.mapped.mutex->AcquireSync(0, INFINITE);
-        d3d11_context->CopySubresourceRegion(
+        ID3D11DeviceContext4* d3d11_context4 = nullptr;
+        hr = d3d11_context->QueryInterface(IID_PPV_ARGS(&d3d11_context4));
+
+        hr = d3d11_context4->Wait(vf.mapped.fence.get(), vf.mapped.counter);
+        d3d11_context4->CopySubresourceRegion(
             vf.mapped.tex.get(), 0,        // Destination texture and subresource slice index
             0, 0, 0,                         // Destination coordinates (X, Y, Z)
-            decoder_texture, texture_slice_index, // Source texture array pointer and matching active frame slice
+            shared_tex, texture_slice_index, // Source texture array pointer and matching active frame slice
             &sourceBox                          // Source box wrapper pointer (nullptr = Copy entire plane layout)
         );
-        d3d11_context->Flush(); 
-        vf.mapped.mutex->ReleaseSync(1);
+        hr = d3d11_context4->Signal(vf.mapped.fence.get(), ++vf.mapped.counter);
+        d3d11_context4->Release();
 
         device.resetFences(*vf.copyFence);
         vk::CommandBufferBeginInfo begin_info{
@@ -868,7 +944,7 @@ public:
         vf.commandBuffer.pipelineBarrier2(dep_info);
 
         vf.commandBuffer.end();
-
+/*
         uint64_t acquireKey = 1;
         uint64_t releaseKey = 0;
         uint32_t timeoutMs  = INFINITE;
@@ -880,14 +956,27 @@ public:
             .releaseCount = 1,
             .pReleaseSyncs = &*vf.memory,
             .pReleaseKeys = &releaseKey,
+        };*/
+        vk::SemaphoreSubmitInfo wait_info{
+            .semaphore = vf.mapped.semaphore,
+            .value = vf.mapped.counter,
+            .stageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+        };
+        vk::SemaphoreSubmitInfo signal_info{
+            .semaphore = vf.mapped.semaphore,
+            .value = ++vf.mapped.counter,
         };
         vk::CommandBufferSubmitInfo cmd_info{
             .commandBuffer = vf.commandBuffer,
         };
         vk::SubmitInfo2 submit_info{
-            .pNext = &keyedMutexInfo,
+//            .pNext = &keyedMutexInfo,
+            .waitSemaphoreInfoCount = 1,
+            .pWaitSemaphoreInfos = &wait_info,
             .commandBufferInfoCount = 1,
             .pCommandBufferInfos = &cmd_info,
+            .signalSemaphoreInfoCount = 1,
+            .pSignalSemaphoreInfos = &signal_info
         };
         queue.submit2(submit_info, vf.copyFence);
 #endif
@@ -906,7 +995,14 @@ public:
         vf.frame_data = std::move(frame_data);
         AVFrame *frame = vf.frame_data.frame.get();
         if (frame->hw_frames_ctx) {
-            upmap(vf, device, queue);
+            while (true) {
+                upmap(vf, device, queue);
+                if (vf.status == VkFrame::Retry) {
+                    init_frame(vf, vf.frame_data.frame.get(), device);
+                    continue;
+                }
+                break;
+            }
             return;
         }
 
@@ -1124,4 +1220,62 @@ public:
 
 		return sws_ctx != nullptr;
 	}
+    
+#ifdef __WIN32
+private:
+    std::unique_ptr<ID3D11Device, D3Deleter<ID3D11Device>> d3d11_device;
+    std::unique_ptr<ID3D11DeviceContext, D3Deleter<ID3D11DeviceContext>> d3d11_context;
+
+    void init_d3d() {
+        ID3D11Device *d3d11_device = this->d3d11_device.get();
+        ID3D11DeviceContext *d3d11_context = this->d3d11_context.get();
+        if (!d3d11_device) {
+            D3D_FEATURE_LEVEL featureLevels[] = {
+                D3D_FEATURE_LEVEL_11_1,
+                D3D_FEATURE_LEVEL_11_0
+            };
+            D3D_FEATURE_LEVEL selectedFeatureLevel;
+
+            // 2. Ensure BGRA/Sharing support is active via creation flags
+            UINT creationFlags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+#ifndef NDEBUG
+            creationFlags |= D3D11_CREATE_DEVICE_DEBUG;
+#endif                
+            HRESULT hr = D3D11CreateDevice(
+                nullptr,                    // Use default adapter (or your matched Vulkan GPU LUID adapter)
+                D3D_DRIVER_TYPE_HARDWARE,
+                nullptr,
+                creationFlags,
+                featureLevels,
+                2,                          // Array size
+                D3D11_SDK_VERSION,
+                &d3d11_device,
+                &selectedFeatureLevel,
+                &d3d11_context
+            );
+            if (selectedFeatureLevel < D3D_FEATURE_LEVEL_11_1) {
+                // NT Handles and 10-bit AV1 zero-copy configurations may fail on this hardware/driver level
+            }
+#ifndef NDEBUG
+            ID3D11Debug *d3dDebug;
+            if (SUCCEEDED(d3d11_device->QueryInterface(IID_PPV_ARGS(&d3dDebug)))) {
+                ID3D11InfoQueue *infoQueue;
+                if (SUCCEEDED(d3dDebug->QueryInterface(IID_PPV_ARGS(&infoQueue)))) {
+                    // Optional: break on serious problems
+                    infoQueue->SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_CORRUPTION, TRUE);
+                    infoQueue->SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_ERROR, TRUE);
+
+                    // Optional: push an empty filter so nothing is filtered out
+                    infoQueue->PushEmptyStorageFilter();
+                    infoQueue->Release();
+                }
+                d3dDebug->Release();
+            } else {
+            }
+#endif
+            this->d3d11_device.reset(d3d11_device);
+            this->d3d11_context.reset(d3d11_context);
+        }
+    }
+#endif
 };

@@ -12,25 +12,14 @@ extern "C" {
 #include <libavutil/hwcontext_d3d11va.h>
 }
 #include <d3d11.h>
+#include <d3d11_4.h>
 #include <dxgi1_2.h>
 #endif
-
-template <typename T>
-struct D3Deleter {
-    void operator()(T *t) const {
-        t->Release();
-    }
-};
 
 vk::PhysicalDeviceMemoryProperties memProperties;
 vk::SurfaceFormatKHR swapChainSurfaceFormat;
 vk::Extent2D swapChainExtent;
 uint32_t queueIndex     = ~0;
-
-#ifdef _WIN32
-std::unique_ptr<ID3D11Device, D3Deleter<ID3D11Device>> d3d11_device;
-std::unique_ptr<ID3D11DeviceContext, D3Deleter<ID3D11DeviceContext>> d3d11_context;
-#endif
 
 inline uint32_t findMemoryType(uint32_t typeFilter, vk::MemoryPropertyFlags properties) {
     for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
@@ -41,3 +30,18 @@ inline uint32_t findMemoryType(uint32_t typeFilter, vk::MemoryPropertyFlags prop
 
     throw std::runtime_error("failed to find suitable memory type!");
 }
+
+#ifdef _WIN32
+template <typename T>
+struct D3Deleter {
+    void operator()(T *t) const {
+        t->Release();
+    }
+};
+
+struct HandleDeleter {
+    void operator()(HANDLE t) const {
+        CloseHandle(t);
+    }
+};
+#endif
