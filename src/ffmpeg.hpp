@@ -94,6 +94,63 @@ public:
     }
 };
 
+class D3DFramePool {
+protected:
+    moodycamel::ConcurrentQueue<ID3D11Texture2D *> recycle_queue;
+    UINT width = 0;
+    UINT height = 0;
+    DXGI_FORMAT format;
+
+public:
+    ~D3DFramePool() {
+        clear();
+    }
+
+    void clear() {
+        ID3D11Texture2D *frame;
+        while (recycle_queue.try_dequeue(frame)) {
+            frame->Release();
+        }
+    }
+
+    void init(UINT w, UINT h, DXGI_FORMAT fmt) {
+        if (width != w || height != h || format != fmt) {
+            clear();
+            width = w;
+            height = h;
+            format = fmt;
+        }
+    }
+
+    void recycle(ID3D11Texture2D *frame) {
+        if (!frame)
+            return;
+        recycle_queue.enqueue(frame);
+    }
+
+    ID3D11Texture2D *alloc(ID3D11Device *d3d11_device) {
+        ID3D11Texture2D *frame;
+        if (recycle_queue.try_dequeue(frame))
+            return frame;
+
+        D3D11_TEXTURE2D_DESC desc{
+            .Width = width,
+            .Height = height,
+            .MipLevels = 1,
+            .ArraySize = 1,
+            .Format = format,
+            .SampleDesc = {
+                .Count = 1,
+            },
+            .Usage = D3D11_USAGE_DEFAULT,
+//                .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
+            .MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED,
+        };
+        HRESULT hr = d3d11_device->CreateTexture2D(&desc, nullptr, &frame);
+        return frame;
+    }
+};
+
 struct AVSubtitle_ : public AVSubtitle {
     double frame_time;
     double duration;
@@ -128,6 +185,7 @@ public:
 
 FramePool frame_pool;
 SubtitlePool sub_pool;
+D3DFramePool d3dframe_pool;
 
 inline AVFrame *frame_alloc() {
     return frame_pool.alloc();
@@ -144,6 +202,30 @@ inline AVSubtitle_ *subtitle_alloc() {
 inline void subtitle_recycle(AVSubtitle_ *frame) {
     sub_pool.recycle(frame);
 }
+
+struct AvFrameDeleter {
+    void operator()(AVFrame *frame) const {
+        ff::frame_recycle(frame);
+    }
+};
+
+using AvFramePtr = std::unique_ptr<AVFrame, AvFrameDeleter>;
+
+struct D3DFrameRecycler {
+    void operator()(ID3D11Texture2D *t) const {
+        d3dframe_pool.recycle(t);
+    }
+};
+
+struct AvFrameData {
+    AvFramePtr frame;
+    double play_time;
+#ifdef _WIN32
+    std::unique_ptr<ID3D11Texture2D, D3DFrameRecycler> tex;
+#endif
+};
+
+using time_point = std::chrono::time_point<std::chrono::steady_clock, std::chrono::duration<double>>;
 
 class VideoFile {
 public:
@@ -180,7 +262,7 @@ public:
     auto is_video() const { return video_available; }
 
     moodycamel::ReaderWriterQueue<AVFrame *> audio_frame_queue;
-    moodycamel::ReaderWriterQueue<AVFrame *> video_frame_queue;
+    moodycamel::ReaderWriterQueue<AvFrameData> video_frame_queue;
     moodycamel::ReaderWriterQueue<AVSubtitle_ *> sub_queue;
     std::mutex mutex;
     std::condition_variable cv;
@@ -188,7 +270,7 @@ public:
     bool is_paused = false;
     bool is_seeking = false;
     double seek_time;
-    std::atomic<double> shared_tick;
+    std::atomic<time_point> shared_tp;
     std::atomic<bool> is_eof;
     bool video_available;
 
@@ -389,7 +471,15 @@ public:
     }
 #endif
 
-    bool open_video_decoder(const AVCodecParameters *codec_params, const AVCodec *codec, bool hwdec) {
+    bool open_video_decoder(const AVStream *stream, bool hwdec) {
+        auto codec_params = stream->codecpar;
+        const AVCodec *codec = nullptr;
+        if (codec_params->codec_id == AV_CODEC_ID_AV1 && hwdec)
+            codec = avcodec_find_decoder_by_name("av1");
+        else
+            codec = avcodec_find_decoder(codec_params->codec_id);
+        if (!codec)
+            return false;
         video_codec_ctx = avcodec_alloc_context3(codec);
         if (hwdec) {
 #ifdef __linux__
@@ -409,11 +499,9 @@ public:
                 d3d11_ctx->device         = d3d11_device.get(); // Still pass your healthy shared device
                 d3d11_ctx->device_context = d3d11_context.get();
 
-                // Do NOT set MiscFlags or BindFlags here. Let FFmpeg handle it safely.
-
                 if (av_hwdevice_ctx_init(hw_device_ctx) == 0) {
                     video_codec_ctx->hw_device_ctx = hw_device_ctx;
-                    video_codec_ctx->get_format = negotiate_hw_format;
+//                    video_codec_ctx->get_format = negotiate_hw_format;
                 } else
                     av_buffer_unref(&hw_device_ctx);
             }
@@ -435,22 +523,16 @@ public:
 
     bool open_video_decoder(bool hwdec = true)
     {
-        AVCodecParameters *codec_params = format_ctx->streams[video_stream_index]->codecpar;
-        const AVCodec *codec = nullptr;
+        auto stream = format_ctx->streams[video_stream_index];
+        AVCodecParameters *codec_params = stream->codecpar;
 
-        if (codec_params->codec_id == AV_CODEC_ID_AV1 && hwdec) {
-            codec = avcodec_find_decoder_by_name("av1");
-            if (codec && open_video_decoder(codec_params, codec, true))
-                return true;
-            hwdec = false;
-        } else {
-            switch (codec_params->format) {
-                case AV_PIX_FMT_GRAY8:
-                    hwdec = false;
-            }
+        switch (codec_params->format) {
+            case AV_PIX_FMT_GRAY8:
+                hwdec = false;
         }
-        codec = avcodec_find_decoder(codec_params->codec_id);
-        return open_video_decoder(codec_params, codec, hwdec);
+        if (hwdec && open_video_decoder(stream, true))
+            return true;
+        return open_video_decoder(stream, false);
     }
 
     bool open_subtitle_decoder() {
@@ -627,7 +709,43 @@ public:
                             if (is_seeking) {
                                 set_seeking(false);
                             }
+#ifdef _WIN32
                             auto new_frame = frame_alloc();
+                            AvFrameData data{
+                                .play_time = last_video_time,
+                            };
+                            if (frame->hw_frames_ctx) {
+                                av_frame_copy_props(new_frame, frame);
+                                new_frame->width = frame->width;
+                                new_frame->height = frame->height;
+                                AVHWFramesContext *hwfc = (AVHWFramesContext*)frame->hw_frames_ctx->data;
+                                new_frame->format = hwfc->sw_format;
+
+                                ID3D11Texture2D *tex = (ID3D11Texture2D*)frame->data[0];
+                                UINT slice = (UINT)(intptr_t)frame->data[1];
+                                D3D11_TEXTURE2D_DESC decoded_desc{};
+                                tex->GetDesc(&decoded_desc);
+                                
+                                d3dframe_pool.init(frame->width, frame->height, decoded_desc.Format);
+                                ID3D11Texture2D *new_tex = d3dframe_pool.alloc(d3d11_device.get());
+                                D3D11_BOX sourceBox{
+                                    .right = (UINT) frame->width,
+                                    .bottom = (UINT) frame->height,
+                                    .back = 1
+                                };                                
+
+                                d3d11_context->CopySubresourceRegion(new_tex, 0, 0, 0, 0, tex, slice, &sourceBox);
+                                data.tex.reset(new_tex);
+                            } else {
+                                av_frame_move_ref(new_frame, frame);
+                            }
+                            data.frame.reset(new_frame);
+                            video_frame_queue.enqueue(std::move(data));
+#else
+                            auto new_frame = frame_alloc();
+                            AvFrameData data{
+                                .play_time = last_video_time,
+                            };
 #ifdef _TEST                            
                             if (frame->hw_frames_ctx) {
                                 auto err = av_hwframe_transfer_data(new_frame, frame, 0);
@@ -640,7 +758,9 @@ public:
 #else
                             av_frame_move_ref(new_frame, frame);
 #endif
-                            video_frame_queue.enqueue(new_frame);
+                            data.frame.reset(new_frame);
+                            video_frame_queue.enqueue(std::move(data));
+#endif
                         }
                         av_frame_unref(frame);
                     }
@@ -681,17 +801,33 @@ public:
         return read_result;
     }
 
+    static inline double elapsed_time(time_point to, time_point from) {
+        return std::chrono::duration<double>(to - from).count();
+    }
+
+    static inline double elapsed_time(time_point from) {
+        return elapsed_time(std::chrono::steady_clock::now(), from);
+    }
+
+    inline double get_play_time() const {
+        return elapsed_time(shared_tp.load(std::memory_order_relaxed));
+    }
+
+    inline void set_play_time(double ts) {
+        shared_tp.store(std::chrono::steady_clock::now() - std::chrono::duration<double>(ts), std::memory_order_relaxed);
+    }
+
     double time_next_frame() {
         if (is_paused && !is_seeking)
             return LARGE_INTERVAL;
-        auto tick = get_ticks();
-        double play_time = is_seeking ? seek_time : (tick - shared_tick.load(std::memory_order_relaxed));
+        time_point tp = std::chrono::steady_clock::now();
+        double play_time = is_seeking ? seek_time : elapsed_time(tp, shared_tp.load(std::memory_order_relaxed));
         auto rlt = read_next_frame(play_time, true);
 //            SDL_Log("%i %i\n", audio_frame_queue.size_approx(), video_frame_queue.size_approx());
         if (rlt < 0) {
             return LARGE_INTERVAL;
         }
-        return 0.1 - (get_ticks() - tick);
+        return 0.1 - elapsed_time(tp);
     }
 
     static void thread_worker(VideoFile *video)
@@ -726,14 +862,6 @@ public:
             thread.join();
     }
 
-    static double get_ticks() {
-        return static_cast<double>(SDL_GetPerformanceCounter()) / SDL_GetPerformanceFrequency();
-    }
-
-    double get_play_time() const {
-        return is_seeking ? seek_time : (get_ticks() - shared_tick.load(std::memory_order_relaxed));
-    }
-
 private:
     AVFormatContext* format_ctx = nullptr;
     AVCodecContext* audio_codec_ctx = nullptr;
@@ -762,9 +890,9 @@ private:
     std::unique_ptr<ID3D11DeviceContext, D3Deleter<ID3D11DeviceContext>> d3d11_context;
 
     void init_d3d() {
-        ID3D11Device *d3d11_device = this->d3d11_device.get();
-        ID3D11DeviceContext *d3d11_context = this->d3d11_context.get();
         if (!d3d11_device) {
+            ID3D11Device *d3d11_device = nullptr;
+            ID3D11DeviceContext *d3d11_context = nullptr;
             D3D_FEATURE_LEVEL featureLevels[] = {
                 D3D_FEATURE_LEVEL_11_1,
                 D3D_FEATURE_LEVEL_11_0
@@ -773,9 +901,9 @@ private:
 
             // 2. Ensure BGRA/Sharing support is active via creation flags
             UINT creationFlags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-#ifndef NDEBUG
+    #ifndef NDEBUG
             creationFlags |= D3D11_CREATE_DEVICE_DEBUG;
-#endif
+    #endif
             HRESULT hr = D3D11CreateDevice(
                 nullptr,                    // Use default adapter (or your matched Vulkan GPU LUID adapter)
                 D3D_DRIVER_TYPE_HARDWARE,
@@ -791,7 +919,7 @@ private:
             if (selectedFeatureLevel < D3D_FEATURE_LEVEL_11_1) {
                 // NT Handles and 10-bit AV1 zero-copy configurations may fail on this hardware/driver level
             }
-#ifndef NDEBUG
+    #ifndef NDEBUG
             ID3D11Debug *d3dDebug;
             if (SUCCEEDED(d3d11_device->QueryInterface(IID_PPV_ARGS(&d3dDebug)))) {
                 ID3D11InfoQueue *infoQueue;
@@ -807,11 +935,11 @@ private:
                 d3dDebug->Release();
             } else {
             }
-#endif
+    #endif
             this->d3d11_device.reset(d3d11_device);
             this->d3d11_context.reset(d3d11_context);
         }
     }
-#endif    
+#endif
 };
 } // namespace ff

@@ -201,11 +201,12 @@ private:
 
 		// Check if the physicalDevice supports the required features
 		auto features                 = physicalDevice.template getFeatures2<vk::PhysicalDeviceFeatures2,
-		                                                                     vk::PhysicalDeviceVulkan13Features,
-		                                                                     vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
-		bool supportsRequiredFeatures = features.template get<vk::PhysicalDeviceFeatures2>().features.samplerAnisotropy &&
-		                                features.template get<vk::PhysicalDeviceVulkan13Features>().dynamicRendering &&
-		                                features.template get<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>().extendedDynamicState;
+																			 vk::PhysicalDeviceVulkan11Features,
+																			 vk::PhysicalDeviceVulkan12Features,
+		                                                                     vk::PhysicalDeviceVulkan13Features>();
+		bool supportsRequiredFeatures = features.template get<vk::PhysicalDeviceVulkan13Features>().dynamicRendering &&
+								features.template get<vk::PhysicalDeviceVulkan11Features>().samplerYcbcrConversion &&
+								features.template get<vk::PhysicalDeviceVulkan12Features>().runtimeDescriptorArray;
 
 		// Return true if the physicalDevice meets all the criteria
 		return supportsVulkan1_3 && supportsGraphicsAndPresent && supportsAllRequiredExtensions && supportsRequiredFeatures;
@@ -243,13 +244,15 @@ private:
 		}
 
 		// query for Vulkan 1.3 features
-		vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT, vk::PhysicalDeviceSamplerYcbcrConversionFeatures, vk::PhysicalDeviceDescriptorIndexingFeatures, vk::PhysicalDeviceTimelineSemaphoreFeatures> featureChain = {
-		    {.features = {.samplerAnisotropy = true}},                   // vk::PhysicalDeviceFeatures2
-		    {.synchronization2 = true, .dynamicRendering = true},        // vk::PhysicalDeviceVulkan13Features
-		    {.extendedDynamicState = true},                               // vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT
+		vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features, vk::PhysicalDeviceVulkan12Features, vk::PhysicalDeviceVulkan13Features> featureChain = {
+			{},
 			{.samplerYcbcrConversion = true},
-			{.shaderSampledImageArrayNonUniformIndexing = true, .runtimeDescriptorArray = true},
-			{.timelineSemaphore = true},
+			{.shaderSampledImageArrayNonUniformIndexing = true, .runtimeDescriptorArray = true,
+#ifdef _WIN32
+				.timelineSemaphore = true,
+#endif			
+			},
+		    {.synchronization2 = true, .dynamicRendering = true},        // vk::PhysicalDeviceVulkan13Features
 		};
 
 		// create a Device
@@ -523,6 +526,7 @@ public:
     float video_pan_x = 0.0;
     float video_pan_y = 0.0;
 	auto get_pix_fmt() { return video.pix_fmt; }
+	const auto& get_device() { return device; }
 
     bool init(SDL_Window *window) {
         SDL_GetWindowSizeInPixels(window, &wnd_w, &wnd_h);
@@ -541,11 +545,11 @@ public:
 #endif // APP_USE_VULKAN_DEBUG_REPORT
     }
 
-    void set_frame(AvFrameData frame_data, AppSub sub) {
-        if (!video.check_frame(frame_data.frame.get()))
+    void set_frame(ff::AvFrameData frame_data, AppSub sub) {
+		if (!video.check_frame(frame_data.frame.get()))
 		{
 			device.waitIdle();
-		    video.init(frame_data.frame.get(), physicalDevice, device);
+			video.init(frame_data, physicalDevice, device);
 			reset_scale();
 		}
         video.upload(std::move(frame_data), device, queue);
@@ -573,13 +577,7 @@ public:
 			.position = { video_pan_x / wnd_w, video_pan_y / wnd_h },
 			.size = { w, h }
 		};
-        Uniforms uf = {
-            .tex_size = {(float)vf.frame_data.frame->width, (float)vf.frame_data.frame->height},
-//            .color_range = fd.frame->color_range == AVCOL_RANGE_UNSPECIFIED ? AVCOL_RANGE_MPEG : fd.frame->color_range,
-//            .colorspace = fd.frame->colorspace == AVCOL_SPC_UNSPECIFIED ? AVCOL_SPC_BT709 : fd.frame->colorspace
-        };
         commandBuffer.pushConstants(video.pipelineLayout, vk::ShaderStageFlagBits::eVertex, 0, sizeof(tf), &tf);
-        commandBuffer.pushConstants(video.pipelineLayout, vk::ShaderStageFlagBits::eFragment, sizeof(Vertform), sizeof(uf), &uf);
 		commandBuffer.draw(4, 1, 0, 0);
 	}
 
@@ -756,9 +754,5 @@ public:
 
 	void discard_pending() {
 		video.discard_pending();
-	}
-
-	const auto& get_device() {
-		return device;
 	}
 };

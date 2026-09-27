@@ -84,7 +84,7 @@ struct ImageData {
 struct DataSet {
     enum Status {
         None,
-        Init,
+        New,
         Upload,
         Ready,
         Discard

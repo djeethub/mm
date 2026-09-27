@@ -473,6 +473,11 @@ public:
     }
 
     void draw(const vk::CommandBuffer commandBuffer) {
+        auto next_idx = (dataIdx + 1) % N_INFLIGHT_SUB;
+        if (data[next_idx].status == DataSet::Ready) {
+            data[dataIdx].status = DataSet::New;
+            dataIdx = next_idx;
+        }
         auto& ds = data[dataIdx];
         if (ds.status != DataSet::Ready)
             return;
@@ -504,7 +509,6 @@ public:
                 auto err = device.waitForFences(*ad.copyFence, vk::True, 0);
                 if (err == vk::Result::eSuccess) {
                     ad.status = DataSet::Ready;
-                    dataIdx = next_idx;
                     return true;
                 }
             }
@@ -514,6 +518,8 @@ public:
             if (err == vk::Result::eSuccess) {
                 return true;
             }
+            return false;
+        } else if (ad.status == DataSet::Ready) {
             return false;
         }
         return true;

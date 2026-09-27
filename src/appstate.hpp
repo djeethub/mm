@@ -118,8 +118,9 @@ public:
         gpu.discard_pending();
 
         AVFrame *frame;
-        while (video.video_frame_queue.try_dequeue(frame))
-            ff::frame_recycle(frame);
+        ff::AvFrameData fd;
+        while (video.video_frame_queue.try_dequeue(fd))
+            ;
         while (video.audio_frame_queue.try_dequeue(frame))
             ff::frame_recycle(frame);
         ff::AVSubtitle_ *sub;
@@ -321,7 +322,7 @@ public:
             video.is_seeking = true;
             video.status = ff::Reset;
 //            video.read_next_frame(seek_time);
-            video.shared_tick.store(get_ticks() - seek_time, std::memory_order_relaxed);
+            video.set_play_time(seek_time);
         }
         video.cv.notify_one();
         video.start_thread();
@@ -372,7 +373,7 @@ public:
                 is_seeking = true;
                 video.status = ff::Reset;
 //                video.read_next_frame(ts);
-                video.shared_tick.store(get_ticks() - ts, std::memory_order_relaxed);
+                video.set_play_time(ts);
             } else
                 return false;
         }
@@ -435,7 +436,7 @@ public:
             if (is_seeking) {
                 is_seeking = false;
                 auto frame_time = frame->pts * video.get_audio_time_base();
-                set_play_time(frame_time);
+                video.set_play_time(frame_time);
             }
             if (av_sample_fmt_is_planar(static_cast<AVSampleFormat>(frame->format))) {
                 // Perfect for FLTP (extracts from any standard video file container)
@@ -449,21 +450,17 @@ public:
         }
     }
 
-    AvFrameData fetch_video_frame(double play_time) {
-        AVFrame *frame = nullptr;
-        AvFrameData data;
+    ff::AvFrameData fetch_video_frame(double play_time) {
+        ff::AvFrameData data;
         while (auto pp = video.video_frame_queue.peek())
         {
-            frame = *pp;
-            auto frame_time = frame->pts * video.get_video_time_base();
             if (is_seeking && !video.is_audio()) {
-                play_time = frame_time;
+                play_time = pp->play_time;
                 is_seeking = false;
-                set_play_time(play_time);
+                video.set_play_time(play_time);
             }
-            if (data.frame == nullptr || frame_time <= play_time) {
-                data.frame.reset(frame);
-                data.play_time = frame_time;
+            if (!data.frame || pp->play_time <= play_time) {
+                data = std::move(*pp);
                 video.video_frame_queue.pop();
             } else {
                 break;
@@ -554,17 +551,8 @@ public:
         }
     }
 
-    static double get_ticks() {
-        return static_cast<double>(SDL_GetPerformanceCounter()) / SDL_GetPerformanceFrequency();
-    }
-
-    void set_play_time(double play_time)
-    {
-        video.shared_tick.store(get_ticks() - play_time, std::memory_order_relaxed);
-    }
-
     double get_play_time() const {
-        return video.is_paused ? seek_time : (get_ticks() - video.shared_tick.load(std::memory_order_relaxed));
+        return video.is_paused ? seek_time : video.get_play_time();
     }
 
     void resize_window(float window_scale = 1.0) {
@@ -622,7 +610,7 @@ public:
                     return;
                 video.is_paused = false;
                 video.status = ff::Reset;
-                video.shared_tick.store(get_ticks() - seek_time, std::memory_order_relaxed);
+                video.set_play_time(seek_time);
             } else {
                 SDL_PauseAudioStreamDevice(audio_stream);
                 seek_time = get_play_time();
@@ -664,7 +652,7 @@ public:
         static bool is_playing = false;
         if (is_playing != play) {
             is_playing = play;
-            SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, play ? 0 : "waitevent");
+            SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, play ? "0" : "waitevent");
         }
     }
 
@@ -678,9 +666,9 @@ public:
                     sub->check_next_frame(play_time);
             }, app_sub);
             while (gpu.check_next_frame(play_time)) {
-                auto video_frame = fetch_video_frame(play_time);
-                if (video_frame.frame) {
-                    gpu.set_frame(std::move(video_frame), app_sub);
+                ff::AvFrameData data = fetch_video_frame(play_time);
+                if (data.frame) {
+                    gpu.set_frame(std::move(data), app_sub);
                 } else {
                     if (video.is_eof.load(std::memory_order_relaxed)) {
                         auto duration = video.get_duration();

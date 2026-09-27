@@ -1,9 +1,5 @@
 #version 450
 
-layout(push_constant, std430) uniform pc {
-    layout(offset = 16) vec2  u_tex_size;
-};
-
 layout(set = 0, binding = 0) uniform sampler2D u_tex_y;
 
 layout(location = 0) in vec2 v_uv;
@@ -13,7 +9,7 @@ void main() {
     // Calculate how many source texels fit inside ONE screen pixel
     vec2 duv_dx = dFdx(v_uv);
     vec2 duv_dy = dFdy(v_uv);
-    vec2 texelsPerPixel = vec2(length(duv_dx), length(duv_dy)) * u_tex_size;
+    vec2 texelsPerPixel = vec2(length(duv_dx), length(duv_dy)) * textureSize(u_tex_y, 0);
 
     // --- DOWNSCALING PATH (Large image shrunk into small window) ---
     if (texelsPerPixel.x > 1.2 || texelsPerPixel.y > 1.2) {

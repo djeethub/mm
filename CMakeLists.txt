@@ -29,14 +29,14 @@ set_target_properties(my_imgui PROPERTIES EXCLUDE_FROM_ALL TRUE)
 # Shaders
 set(SHADER_SOURCES
     shaders/vert.vert
+    shaders/nv12.frag
+    shaders/rgb.frag
+    shaders/gray.frag
+    shaders/yuyv.frag
     shaders/ass.vert
     shaders/ass.frag
-    shaders/rgb.frag
-    shaders/nv12.frag
-    shaders/gray.frag
     shaders/bitmap.vert
     shaders/bitmap.frag
-    shaders/yuyv.frag
 )
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -90,8 +90,6 @@ set_target_properties(main PROPERTIES
     WIN32_EXECUTABLE $<CONFIG:Release>
 )
 add_dependencies(main CompileShaders)
-
-target_compile_definitions(main PRIVATE SDL_MAIN_USE_CALLBACKS=1)
 
 target_include_directories(main PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}/vendor/imgui

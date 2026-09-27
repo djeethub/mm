@@ -2,16 +2,13 @@
 
 #include "utils.glsl"
 
-layout(push_constant, std430) uniform pc {
-    layout(offset = 16) vec2  u_tex_size;
-};
-
 layout(set = 0, binding = 0) uniform sampler2D u_tex_y;
 
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 o_color;
 
 void main() {
+    vec2 u_tex_size = textureSize(u_tex_y, 0);
     float col = v_uv.x * u_tex_size.x;
     bool even  = mod(col, 2.0) < 1.0;
 

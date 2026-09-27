@@ -10,20 +10,15 @@
 #include "gray.frag.h"
 #include "yuyv.frag.h"
 
-#define N_INFLIGHT_VIDEO    4
+#define N_INFLIGHT_VIDEO   4
 
 enum ShaderType
 {
 	VERT,
-	RGB_FRAG,
 	NV12_FRAG,
-	YUV_FRAG,
+	RGB_FRAG,
 	GRAY_FRAG,
-	PAL8_FRAG,
-	YUV_10_FRAG,
 	YUYV_FRAG,
-	YA_FRAG,
-	YUVA_FRAG
 };
 
 struct Vertform {
@@ -31,31 +26,7 @@ struct Vertform {
     float size[2];     // width, height (in NDC: 0.0 to 2.0)
 };
 
-struct Uniforms
-{
-	float tex_size[2]; // width, height of Y plane
-};
-
-struct AvFrameDeleter {
-    void operator()(AVFrame *frame) const {
-        ff::frame_recycle(frame);
-    }
-};
-
-struct AvFrameData {
-    std::unique_ptr<AVFrame, AvFrameDeleter> frame;
-    double play_time;
-};
-
 #ifdef _WIN32
-struct D3D11Data {
-    std::unique_ptr<ID3D11Texture2D, D3Deleter<ID3D11Texture2D>> tex;
-    std::unique_ptr<ID3D11Texture2D, D3Deleter<ID3D11Texture2D>> shared_tex;
-    std::unique_ptr<ID3D11Fence, D3Deleter<ID3D11Fence>> fence;
-    vk::raii::Semaphore semaphore = nullptr;
-    uint64_t counter;
-};
-
 void check_d3d_result(HRESULT hr) {
     if (hr == S_OK)
         return;
@@ -80,9 +51,8 @@ struct VkFrame {
         None,
         New,
         Upload,
-        Discard,
         Ready,
-        Retry,
+        Discard,
     };
 
     vk::raii::Image image = nullptr;
@@ -94,11 +64,9 @@ struct VkFrame {
     vk::DescriptorSet set = nullptr;
     vk::CommandBuffer commandBuffer = nullptr;
 
-    AvFrameData frame_data;
+    ff::AvFrameData frame_data;
 #ifdef __linux__
     std::unique_ptr<AVFrame, AvFrameDeleter> mapped;
-#else
-    D3D11Data mapped;
 #endif
     Status status = None;
 };
@@ -122,150 +90,11 @@ private:
     bool native = true;
     SwsContext *sws_ctx = nullptr;
 
-    void init_frame(VkFrame& vf, const AVFrame *frame, const vk::raii::Device& device) {
-        if (frame->hw_frames_ctx) {
-#ifdef _WIN32
-            // 1. Get the texture handles from the incoming AVFrame
-            ID3D11Texture2D* decoder_texture = (ID3D11Texture2D*)frame->data[0];
-            ID3D11Texture2D* d3d11_texture = nullptr;
-            D3D11_TEXTURE2D_DESC decoded_desc{};
-            decoder_texture->GetDesc(&decoded_desc);
-
-            D3D11_TEXTURE2D_DESC desc{
-                .Width = (UINT) width,
-                .Height = (UINT) height,
-                .MipLevels = 1,
-                .ArraySize = 1,
-                .Format = decoded_desc.Format,
-                .SampleDesc = {
-                    .Count = 1,
-                },
-                .Usage = D3D11_USAGE_DEFAULT,
-//                .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
-                .MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED,
-            };
-            HRESULT hr = d3d11_device->CreateTexture2D(&desc, nullptr, &d3d11_texture);
-            if (hr != S_OK)
-                throw std::runtime_error("CreateTexture2D failed.");
-
-            vf.mapped.tex.reset(d3d11_texture);
-
-            // Export the handle to Vulkan now!
-            IDXGIResource1* dxgi_res = nullptr;
-            d3d11_texture->QueryInterface(IID_PPV_ARGS(&dxgi_res));
-            HANDLE shared_texture_handle = nullptr;
-            hr = dxgi_res->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ, nullptr, &shared_texture_handle);
-            dxgi_res->Release();
-
-            vk::ExternalMemoryImageCreateInfo external_image_info{
-                .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eD3D11Texture, // or KMT depending on allocation
-            };
-            vk::ImageCreateInfo image_info{
-                .pNext = &external_image_info,
-                .imageType = vk::ImageType::e2D,
-                .format = format,
-                .extent = { .width = (uint32_t) width, .height = (uint32_t) height, .depth = 1 },
-                .mipLevels = 1,
-                .arrayLayers = 1,
-                .samples = vk::SampleCountFlagBits::e1,
-                .tiling = vk::ImageTiling::eOptimal,
-                .usage = vk::ImageUsageFlagBits::eSampled,
-//                .sharingMode = vk::SharingMode::eExclusive,
-            };
-            vf.image = device.createImage(image_info);
-
-            vk::MemoryDedicatedAllocateInfo dedicatedAllocInfo{
-                .image = vf.image,
-                .buffer = nullptr,
-            };
-            vk::ImportMemoryWin32HandleInfoKHR memory_import{
-                .pNext = &dedicatedAllocInfo,
-                .handleType = vk::ExternalMemoryHandleTypeFlagBits::eD3D11Texture,
-                .handle = shared_texture_handle
-            };
-            auto req = vf.image.getMemoryRequirements();
-            vk::MemoryAllocateInfo mem_alloc_info{
-                .pNext = &memory_import,
-                .allocationSize = req.size,
-                .memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal)
-            };
-            vf.memory = device.allocateMemory(mem_alloc_info);
-            vf.image.bindMemory(vf.memory, 0);
-            CloseHandle(shared_texture_handle);
-
-            vk::ImageViewCreateInfo viewInfo{
-                .image = vf.image,     // The VkImage containing your uploaded AVFrame data
-                .viewType = vk::ImageViewType::e2D,
-                .format = format,
-                .subresourceRange = {
-                    .aspectMask = vk::ImageAspectFlagBits::eColor, // Vulkan handles sub-planes internally
-                    .levelCount = 1,
-                    .layerCount = 1
-                },
-            };
-            vk::DescriptorImageInfo imageInfo{
-                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
-            };
-            vk::SamplerYcbcrConversionInfo viewConversionInfo{
-            };
-            if (*ycbcrConversion) {
-                viewConversionInfo.conversion = ycbcrConversion;
-                viewInfo.pNext = &viewConversionInfo; // <-- Crucial!
-            } else {
-                imageInfo.sampler = sampler;
-            }
-            vf.imageView = device.createImageView(viewInfo);
-            
-            imageInfo.imageView = vf.imageView;
-            vk::WriteDescriptorSet descriptorWrites[] = {
-                {
-                    .dstSet = vf.set,
-                    .dstBinding = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-                    .pImageInfo = &imageInfo,
-                },
-            };
-            device.updateDescriptorSets(descriptorWrites, nullptr);
-
-            if (!vf.mapped.fence) {
-                vf.mapped.counter = 0;
-
-                // 1. Query the 11.3 interface
-                ID3D11Device5* d3d11_device5 = nullptr;
-                d3d11_device->QueryInterface(IID_PPV_ARGS(&d3d11_device5));
-
-                // 2. Create a shareable hardware fence
-                ID3D11Fence* d3d11_fence = nullptr;
-                HRESULT hr = d3d11_device5->CreateFence(
-                    vf.mapped.counter, // Initial fence value
-                    D3D11_FENCE_FLAG_SHARED,
-                    IID_PPV_ARGS(&d3d11_fence)
-                );
-                vf.mapped.fence.reset(d3d11_fence);
-
-                vk::SemaphoreTypeCreateInfo timelineInfo{
-                    .semaphoreType = vk::SemaphoreType::eTimeline,
-                    .initialValue = vf.mapped.counter
-                };
-                vk::SemaphoreCreateInfo semaphoreInfo{
-                    .pNext = &timelineInfo
-                };
-                vf.mapped.semaphore = device.createSemaphore(semaphoreInfo);
-
-                HANDLE shared_fence_handle = nullptr;
-                hr = d3d11_fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &shared_fence_handle);
-                d3d11_device5->Release();
-                vk::ImportSemaphoreWin32HandleInfoKHR importInfo{
-                    .semaphore = vf.mapped.semaphore,
-                    .handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eD3D12Fence, // Same underlying kernel type as D3D11 Fence
-                    .handle = shared_fence_handle,
-                };
-                device.importSemaphoreWin32HandleKHR(importInfo);
-                CloseHandle(shared_fence_handle);
-            }
-#endif
+    void init_frame(VkFrame& vf, const ff::AvFrameData& fd, const vk::raii::Device& device) {
+        if (fd.frame->hw_frames_ctx) {
         } else {
+            AVFrame *frame = fd.frame.get();
+
             vk::ImageCreateInfo info{
                 .imageType = vk::ImageType::e2D,
                 .format = format,
@@ -448,20 +277,19 @@ public:
 //                .flags = vk::ImageCreateFlagBits::eMutableFormat,
             };
             auto imageProps = physicalDevice.getImageFormatProperties2(format_info);
+            return (imageProps.sType == vk::StructureType::eImageFormatProperties2);
         } catch (const vk::FormatNotSupportedError& err) {
             return false;
         }
         return true;
     }
 
-    bool init(const AVFrame *frame, const vk::raii::PhysicalDevice& physicalDevice, vk::raii::Device& device) {
+    bool init(const ff::AvFrameData& fd, const vk::raii::PhysicalDevice& physicalDevice, vk::raii::Device& device) {
+        AVFrame *frame = fd.frame.get();
         if (frame->hw_frames_ctx) {
             // Access the frame context structural layer
             AVHWFramesContext *hwfc = (AVHWFramesContext*)frame->hw_frames_ctx->data;
             pix_fmt = hwfc->sw_format;
-#ifdef _WIN32
-            init_d3d();
-#endif
         } else {
             pix_fmt = (AVPixelFormat) frame->format;
         }
@@ -488,9 +316,6 @@ public:
                 break;
             case AV_PIX_FMT_P010:
                 format = vk::Format::eG10X6B10X6R10X62Plane420Unorm3Pack16;
-                break;
-            case AV_PIX_FMT_YUV420P10:
-                format = vk::Format::eG10X6B10X6R10X63Plane420Unorm3Pack16;
                 break;
             case AV_PIX_FMT_RGB24:
                 format = vk::Format::eR8G8B8Unorm;
@@ -525,6 +350,7 @@ public:
 //            case AV_PIX_FMT_YUVA420P:
 //            case AV_PIX_FMT_PAL8:
 //            case AV_PIX_FMT_YA8:
+//            case AV_PIX_FMT_YUV420P10:
             default:
                 if (frame->hw_frames_ctx) {
                     auto msg = std::format("Unsupported pix fmt: {}", av_get_pix_fmt_name(pix_fmt));
@@ -585,6 +411,7 @@ public:
                         ((features & vk::FormatFeatureFlagBits::eMidpointChromaSamples) || 
                             (features & vk::FormatFeatureFlagBits::eCositedChromaSamples));
         bool canLinear = (bool) (features & vk::FormatFeatureFlagBits::eSampledImageFilterLinear);
+        bool canYcbcrLinear = (bool) (features & vk::FormatFeatureFlagBits::eSampledImageYcbcrConversionLinearFilter);
 
         vk::SamplerCreateInfo samplerInfo{
             .magFilter = canLinear ? vk::Filter::eLinear : vk::Filter::eNearest,
@@ -611,7 +438,7 @@ public:
                 .components = { vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity },
                 .xChromaOffset = vk::ChromaLocation::eCositedEven,
                 .yChromaOffset = vk::ChromaLocation::eCositedEven,
-                .chromaFilter = vk::Filter::eLinear
+                .chromaFilter = canYcbcrLinear ? vk::Filter::eLinear : vk::Filter::eNearest
             };
             switch (frame->color_range) {
                 case AVCOL_RANGE_JPEG:
@@ -666,7 +493,7 @@ public:
 
         for (auto i = 0; i < N_INFLIGHT_VIDEO; i++) {
             frames[i].set = sets[i];
-            init_frame(frames[i], frame, device);
+            init_frame(frames[i], fd, device);
         }
 
         createGraphicsPipeline(device);
@@ -729,14 +556,9 @@ public:
                 .stageFlags = vk::ShaderStageFlagBits::eVertex,
                 .offset = 0,
                 .size = sizeof(Vertform),
-            },
-            {
-                .stageFlags = vk::ShaderStageFlagBits::eFragment,
-                .offset = sizeof(Vertform),
-                .size = sizeof(Uniforms),
             }
         };
-		vk::PipelineLayoutCreateInfo pipelineLayoutInfo{.setLayoutCount = 1, .pSetLayouts = &*layout, .pushConstantRangeCount = 2, .pPushConstantRanges = push_constants};
+		vk::PipelineLayoutCreateInfo pipelineLayoutInfo{.setLayoutCount = 1, .pSetLayouts = &*layout, .pushConstantRangeCount = 1, .pPushConstantRanges = push_constants};
 		pipelineLayout = vk::raii::PipelineLayout(device, pipelineLayoutInfo);
 
 		vk::StructureChain<vk::GraphicsPipelineCreateInfo, vk::PipelineRenderingCreateInfo> pipelineCreateInfoChain = {
@@ -763,8 +585,6 @@ public:
     }
 
     void upmap(VkFrame& vf, const vk::raii::Device& device, const vk::raii::Queue& queue) {
-        auto frame = vf.frame_data.frame.get();
-
 #ifdef __linux__
         AVFrame *drm_frame = ff::frame_alloc();
         // Map VAAPI surface to DRM PRIME
@@ -878,43 +698,84 @@ public:
         };
         device.updateDescriptorSets(descriptorWrites, nullptr);
 #else
-        HRESULT hr;
-        ID3D11Texture2D* decoder_texture = (ID3D11Texture2D*)frame->data[0];
-        UINT texture_slice_index = (UINT)(intptr_t)frame->data[1];
-
+        // Export the handle to Vulkan now!
         IDXGIResource1* dxgi_res = nullptr;
-        decoder_texture->QueryInterface(IID_PPV_ARGS(&dxgi_res));
+        vf.frame_data.tex->QueryInterface(IID_PPV_ARGS(&dxgi_res));
         HANDLE shared_texture_handle = nullptr;
-        hr = dxgi_res->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ, nullptr, &shared_texture_handle);
+        HRESULT hr = dxgi_res->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ, nullptr, &shared_texture_handle);
         dxgi_res->Release();
 
-        ID3D11Texture2D* shared_tex = nullptr;
-        ID3D11Device1 *d3d11_device1 = nullptr;
-        hr = d3d11_device->QueryInterface(IID_PPV_ARGS(&d3d11_device1));
-        d3d11_device1->OpenSharedResource1(shared_texture_handle, IID_PPV_ARGS(&shared_tex));
-        vf.mapped.shared_tex.reset(shared_tex);
-        d3d11_device1->Release();
+        vk::ExternalMemoryImageCreateInfo external_image_info{
+            .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eD3D11Texture, // or KMT depending on allocation
+        };
+        vk::ImageCreateInfo image_info{
+            .pNext = &external_image_info,
+            .imageType = vk::ImageType::e2D,
+            .format = format,
+            .extent = { .width = (uint32_t) width, .height = (uint32_t) height, .depth = 1 },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .tiling = vk::ImageTiling::eOptimal,
+            .usage = vk::ImageUsageFlagBits::eSampled,
+//                .sharingMode = vk::SharingMode::eExclusive,
+        };
+        vf.image = device.createImage(image_info);
+
+        vk::MemoryDedicatedAllocateInfo dedicatedAllocInfo{
+            .image = vf.image,
+            .buffer = nullptr,
+        };
+        vk::ImportMemoryWin32HandleInfoKHR memory_import{
+            .pNext = &dedicatedAllocInfo,
+            .handleType = vk::ExternalMemoryHandleTypeFlagBits::eD3D11Texture,
+            .handle = shared_texture_handle
+        };
+        auto req = vf.image.getMemoryRequirements();
+        vk::MemoryAllocateInfo mem_alloc_info{
+            .pNext = &memory_import,
+            .allocationSize = req.size,
+            .memoryTypeIndex = findMemoryType(req.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal)
+        };
+        vf.memory = device.allocateMemory(mem_alloc_info);
+        vf.image.bindMemory(vf.memory, 0);
         CloseHandle(shared_texture_handle);
 
-        D3D11_BOX sourceBox{
-            .right = (UINT) width,
-            .bottom = (UINT) height,
-            .back = 1
+        vk::ImageViewCreateInfo viewInfo{
+            .image = vf.image,     // The VkImage containing your uploaded AVFrame data
+            .viewType = vk::ImageViewType::e2D,
+            .format = format,
+            .subresourceRange = {
+                .aspectMask = vk::ImageAspectFlagBits::eColor, // Vulkan handles sub-planes internally
+                .levelCount = 1,
+                .layerCount = 1
+            },
         };
-
-        ID3D11DeviceContext4* d3d11_context4 = nullptr;
-        hr = d3d11_context->QueryInterface(IID_PPV_ARGS(&d3d11_context4));
-
-        hr = d3d11_context4->Wait(vf.mapped.fence.get(), vf.mapped.counter);
-        d3d11_context4->CopySubresourceRegion(
-            vf.mapped.tex.get(), 0,        // Destination texture and subresource slice index
-            0, 0, 0,                         // Destination coordinates (X, Y, Z)
-            shared_tex, texture_slice_index, // Source texture array pointer and matching active frame slice
-            &sourceBox                          // Source box wrapper pointer (nullptr = Copy entire plane layout)
-        );
-        hr = d3d11_context4->Signal(vf.mapped.fence.get(), ++vf.mapped.counter);
-        d3d11_context4->Release();
-
+        vk::DescriptorImageInfo imageInfo{
+            .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+        };
+        vk::SamplerYcbcrConversionInfo viewConversionInfo{
+        };
+        if (*ycbcrConversion) {
+            viewConversionInfo.conversion = ycbcrConversion;
+            viewInfo.pNext = &viewConversionInfo; // <-- Crucial!
+        } else {
+            imageInfo.sampler = sampler;
+        }
+        vf.imageView = device.createImageView(viewInfo);
+        
+        imageInfo.imageView = vf.imageView;
+        vk::WriteDescriptorSet descriptorWrites[] = {
+            {
+                .dstSet = vf.set,
+                .dstBinding = 0,
+                .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                .pImageInfo = &imageInfo,
+            },
+        };
+        device.updateDescriptorSets(descriptorWrites, nullptr);
+/*
         device.resetFences(*vf.copyFence);
         vk::CommandBufferBeginInfo begin_info{
             .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit
@@ -944,6 +805,7 @@ public:
         vf.commandBuffer.pipelineBarrier2(dep_info);
 
         vf.commandBuffer.end();
+*/        
 /*
         uint64_t acquireKey = 1;
         uint64_t releaseKey = 0;
@@ -957,10 +819,10 @@ public:
             .pReleaseSyncs = &*vf.memory,
             .pReleaseKeys = &releaseKey,
         };*/
-        vk::SemaphoreSubmitInfo wait_info{
+/*        vk::SemaphoreSubmitInfo wait_info{
             .semaphore = vf.mapped.semaphore,
             .value = vf.mapped.counter,
-            .stageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+//            .stageMask = vk::PipelineStageFlagBits2::eFragmentShader,
         };
         vk::SemaphoreSubmitInfo signal_info{
             .semaphore = vf.mapped.semaphore,
@@ -978,34 +840,35 @@ public:
             .signalSemaphoreInfoCount = 1,
             .pSignalSemaphoreInfos = &signal_info
         };
-        queue.submit2(submit_info, vf.copyFence);
+        queue.submit2(submit_info, vf.copyFence);*/
 #endif
         
         vf.status = VkFrame::Upload;
     }
 
-    void upload(AvFrameData frame_data, const vk::raii::Device& device, const vk::raii::Queue& queue) {
+    void upload(ff::AvFrameData fd, const vk::raii::Device& device, const vk::raii::Queue& queue) {
         auto next_idx = (frame_idx + 1) % N_INFLIGHT_VIDEO;
+        if (frames[next_idx].status == VkFrame::Ready)
+            next_idx = (next_idx + 1) % N_INFLIGHT_VIDEO;
         auto& vf = frames[next_idx];
         auto err = device.waitForFences(*vf.copyFence, vk::True, 0);
         if (err != vk::Result::eSuccess) {
             return;
         }
 
-        vf.frame_data = std::move(frame_data);
+        vf.frame_data = std::move(fd);
         AVFrame *frame = vf.frame_data.frame.get();
-        if (frame->hw_frames_ctx) {
-            while (true) {
-                upmap(vf, device, queue);
-                if (vf.status == VkFrame::Retry) {
-                    init_frame(vf, vf.frame_data.frame.get(), device);
-                    continue;
-                }
-                break;
-            }
+#ifdef _WIN32
+        if (vf.frame_data.tex) {
+            upmap(vf, device, queue);
             return;
         }
-
+#else
+        if (frame->hw_frames_ctx) {
+            upmap(vf, device, queue);
+            return;
+        }
+#endif
         int offset[4]{};
         // Upload to Buffer:
         uint8_t *map = (uint8_t *) vf.upload_buffer_memory.mapMemory(0, upload_size);
@@ -1165,13 +1028,14 @@ public:
 
     bool check_next_frame(double play_time, const vk::Device& device) {
         auto next_idx = (frame_idx + 1) % N_INFLIGHT_VIDEO;
+        if (frames[next_idx].status == VkFrame::Ready)
+            next_idx = (next_idx + 1) % N_INFLIGHT_VIDEO;
         auto& vf = frames[next_idx];
         if (vf.status == VkFrame::Upload) {
             if (vf.frame_data.play_time <= play_time) {
                 auto err = device.waitForFences(*vf.copyFence, vk::True, 0);
                 if (err == vk::Result::eSuccess) {
                     vf.status = VkFrame::Ready;
-                    frame_idx = next_idx;
                     return true;
                 }
             }
@@ -1186,7 +1050,12 @@ public:
         return true;
     }
 
-    VkFrame& get_current_frame() {
+    const VkFrame& get_current_frame() {
+        auto next_idx = (frame_idx + 1) % N_INFLIGHT_VIDEO;
+        if (frames[next_idx].status == VkFrame::Ready) {
+            frames[frame_idx].status = VkFrame::New;
+            frame_idx = next_idx;
+        }
         return frames[frame_idx];
     }
 
@@ -1220,62 +1089,4 @@ public:
 
 		return sws_ctx != nullptr;
 	}
-    
-#ifdef __WIN32
-private:
-    std::unique_ptr<ID3D11Device, D3Deleter<ID3D11Device>> d3d11_device;
-    std::unique_ptr<ID3D11DeviceContext, D3Deleter<ID3D11DeviceContext>> d3d11_context;
-
-    void init_d3d() {
-        ID3D11Device *d3d11_device = this->d3d11_device.get();
-        ID3D11DeviceContext *d3d11_context = this->d3d11_context.get();
-        if (!d3d11_device) {
-            D3D_FEATURE_LEVEL featureLevels[] = {
-                D3D_FEATURE_LEVEL_11_1,
-                D3D_FEATURE_LEVEL_11_0
-            };
-            D3D_FEATURE_LEVEL selectedFeatureLevel;
-
-            // 2. Ensure BGRA/Sharing support is active via creation flags
-            UINT creationFlags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-#ifndef NDEBUG
-            creationFlags |= D3D11_CREATE_DEVICE_DEBUG;
-#endif                
-            HRESULT hr = D3D11CreateDevice(
-                nullptr,                    // Use default adapter (or your matched Vulkan GPU LUID adapter)
-                D3D_DRIVER_TYPE_HARDWARE,
-                nullptr,
-                creationFlags,
-                featureLevels,
-                2,                          // Array size
-                D3D11_SDK_VERSION,
-                &d3d11_device,
-                &selectedFeatureLevel,
-                &d3d11_context
-            );
-            if (selectedFeatureLevel < D3D_FEATURE_LEVEL_11_1) {
-                // NT Handles and 10-bit AV1 zero-copy configurations may fail on this hardware/driver level
-            }
-#ifndef NDEBUG
-            ID3D11Debug *d3dDebug;
-            if (SUCCEEDED(d3d11_device->QueryInterface(IID_PPV_ARGS(&d3dDebug)))) {
-                ID3D11InfoQueue *infoQueue;
-                if (SUCCEEDED(d3dDebug->QueryInterface(IID_PPV_ARGS(&infoQueue)))) {
-                    // Optional: break on serious problems
-                    infoQueue->SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_CORRUPTION, TRUE);
-                    infoQueue->SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_ERROR, TRUE);
-
-                    // Optional: push an empty filter so nothing is filtered out
-                    infoQueue->PushEmptyStorageFilter();
-                    infoQueue->Release();
-                }
-                d3dDebug->Release();
-            } else {
-            }
-#endif
-            this->d3d11_device.reset(d3d11_device);
-            this->d3d11_context.reset(d3d11_context);
-        }
-    }
-#endif
 };
