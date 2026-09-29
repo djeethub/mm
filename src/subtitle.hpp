@@ -92,18 +92,20 @@ struct DataSet {
 
     std::vector<ImageData> images;
     uint32_t n_images = 0;
-    //vertex
     std::vector<Vertex> vertices;
+
+    vk::raii::Semaphore semaphore = nullptr;
     vk::raii::Buffer buffer = nullptr;
     vk::raii::DeviceMemory memory = nullptr;
-    Uint32 alloc_size = 0;
-
     vk::raii::Fence copyFence = nullptr;
+
     vk::DescriptorSet set = nullptr;
     vk::CommandBuffer commandBuffer = nullptr;
 
+    Uint32 alloc_size = 0;
     Status status = None;
     double play_time;
+    uint64_t counter = 0;
 
     void alloc_buf(const vk::raii::Device& device, uint32_t size) {
         if (alloc_size >= size)

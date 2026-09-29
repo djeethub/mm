@@ -661,14 +661,10 @@ public:
             check_audio_frame();
             check_subtitle();
             auto play_time = get_play_time();
-            std::visit([&](auto&& sub){
-                if (sub)
-                    sub->check_next_frame(play_time);
-            }, app_sub);
             while (gpu.check_next_frame(play_time)) {
                 ff::AvFrameData data = fetch_video_frame(play_time);
                 if (data.frame) {
-                    gpu.set_frame(std::move(data), app_sub);
+                    gpu.set_frame(std::move(data));
                 } else {
                     if (video.is_eof.load(std::memory_order_relaxed)) {
                         auto duration = video.get_duration();
@@ -681,6 +677,12 @@ public:
                     break;
                 }
             }
+            std::visit([&](auto&& sub){
+                if (sub) {
+                    if (sub->check_next_frame(play_time))
+                        sub->prepare_draw(gpu.get_queue(), play_time);
+                }
+            }, app_sub);
         }
 
         gpu.render(app_sub);

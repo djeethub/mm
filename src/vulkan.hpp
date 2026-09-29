@@ -43,13 +43,13 @@ private:
 	std::vector<const char *> requiredDeviceExtension = {
 	    vk::KHRSwapchainExtensionName,
 		vk::KHRExternalMemoryExtensionName,
+		vk::KHRTimelineSemaphoreExtensionName,
 #ifdef __linux__
 		vk::EXTExternalMemoryDmaBufExtensionName,
 		vk::EXTImageDrmFormatModifierExtensionName,
 		vk::KHRExternalMemoryFdExtensionName,
 #else
 		vk::KHRExternalMemoryWin32ExtensionName,
-		vk::KHRTimelineSemaphoreExtensionName,
 		vk::KHRExternalSemaphoreWin32ExtensionName,
 #endif
 	};
@@ -527,6 +527,7 @@ public:
     float video_pan_y = 0.0;
 	auto get_pix_fmt() { return video.pix_fmt; }
 	const auto& get_device() { return device; }
+	const auto& get_queue() { return queue; }
 
     bool init(SDL_Window *window) {
         SDL_GetWindowSizeInPixels(window, &wnd_w, &wnd_h);
@@ -545,7 +546,7 @@ public:
 #endif // APP_USE_VULKAN_DEBUG_REPORT
     }
 
-    void set_frame(ff::AvFrameData frame_data, AppSub sub) {
+    void set_frame(ff::AvFrameData frame_data) {
 		if (!video.check_frame(frame_data.frame.get()))
 		{
 			device.waitIdle();
@@ -553,10 +554,6 @@ public:
 			reset_scale();
 		}
         video.upload(std::move(frame_data), device, queue);
-		std::visit([&](auto&& sub){
-			if (sub)
-				sub->prepare_draw(queue, frame_data.play_time);
-		}, sub);
     }
 
     bool check_next_frame(double play_time) {
@@ -564,7 +561,7 @@ public:
     }
 
 	void render_frame(const vk::CommandBuffer& commandBuffer) {
-        auto& vf = video.get_current_frame();
+        auto& vf = video.get_current_frame(device);
         if (vf.status != VkFrame::Ready)
             return;
 
@@ -670,16 +667,23 @@ public:
         vk::CommandBufferSubmitInfo cmd_info{
             .commandBuffer = commandBuffers[frameIndex],
         };
-		vk::SemaphoreSubmitInfo wait_info{
+		std::vector<vk::SemaphoreSubmitInfo> wait_info;
+		wait_info.reserve(3);
+		wait_info.push_back({
 			.semaphore = presentCompleteSemaphores[frameIndex],
 			.stageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-		};
+		});
+		video.add_wait_info(wait_info);
+		std::visit([&](auto&& sub){
+			if (sub)
+				sub->add_wait_info(wait_info);
+		}, sub);
 		vk::SemaphoreSubmitInfo signal_info{
 			.semaphore = renderFinishedSemaphores[imageIndex],
 		};
         vk::SubmitInfo2 submit_info{
-			.waitSemaphoreInfoCount = 1,
-			.pWaitSemaphoreInfos = &wait_info,
+			.waitSemaphoreInfoCount = (uint32_t) wait_info.size(),
+			.pWaitSemaphoreInfos = wait_info.data(),
             .commandBufferInfoCount = 1,
             .pCommandBufferInfos = &cmd_info,
 			.signalSemaphoreInfoCount = 1,

@@ -55,6 +55,7 @@ struct VkFrame {
         Discard,
     };
 
+    vk::raii::Semaphore semaphore = nullptr;
     vk::raii::Image image = nullptr;
     vk::raii::DeviceMemory memory = nullptr;
     vk::raii::ImageView imageView = nullptr;
@@ -66,13 +67,15 @@ struct VkFrame {
 
     ff::AvFrameData frame_data;
 #ifdef __linux__
-    std::unique_ptr<AVFrame, AvFrameDeleter> mapped;
+    std::unique_ptr<AVFrame, ff::AvFrameDeleter> mapped;
 #endif
     Status status = None;
+    uint64_t counter = 0;
 };
 
 class VkVideo {
 private:
+    vk::raii::Semaphore semaphore = nullptr;
     vk::raii::SamplerYcbcrConversion ycbcrConversion = nullptr;
     vk::raii::Sampler sampler = nullptr;
     vk::raii::DescriptorSetLayout layout = nullptr;
@@ -91,8 +94,7 @@ private:
     SwsContext *sws_ctx = nullptr;
 
     void init_frame(VkFrame& vf, const ff::AvFrameData& fd, const vk::raii::Device& device) {
-        if (fd.frame->hw_frames_ctx) {
-        } else {
+        if (!fd.is_hwdec()) {
             AVFrame *frame = fd.frame.get();
 
             vk::ImageCreateInfo info{
@@ -168,6 +170,17 @@ private:
                 },
             };
             device.updateDescriptorSets(descriptorWrites, nullptr);
+
+            if (vf.semaphore == nullptr) {
+                vk::SemaphoreTypeCreateInfo timelineInfo{
+                    .semaphoreType = vk::SemaphoreType::eTimeline,
+                    .initialValue = vf.counter,
+                };
+                vk::SemaphoreCreateInfo semaphoreInfo{
+                    .pNext = &timelineInfo
+                };
+                vf.semaphore = device.createSemaphore(semaphoreInfo);
+            }
         }
 
         vf.status = VkFrame::New;
@@ -497,6 +510,30 @@ public:
         }
 
         createGraphicsPipeline(device);
+
+#ifdef _WIN32
+        if (fd.is_hwdec() && semaphore == nullptr) {
+            vk::SemaphoreTypeCreateInfo timelineInfo{
+                .semaphoreType = vk::SemaphoreType::eTimeline,
+                .initialValue = 0
+            };
+            vk::SemaphoreCreateInfo semaphoreInfo{
+                .pNext = &timelineInfo
+            };
+            semaphore = device.createSemaphore(semaphoreInfo);
+
+            HANDLE shared_fence_handle = nullptr;
+            d3d11_fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &shared_fence_handle);
+            vk::ImportSemaphoreWin32HandleInfoKHR importInfo{
+                .semaphore = semaphore,
+                .handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eD3D12Fence, // Same underlying kernel type as D3D11 Fence
+                .handle = shared_fence_handle,
+            };
+            device.importSemaphoreWin32HandleKHR(importInfo);
+            CloseHandle(shared_fence_handle);
+        }
+#endif
+
         return true;
     }
 
@@ -586,6 +623,7 @@ public:
 
     void upmap(VkFrame& vf, const vk::raii::Device& device, const vk::raii::Queue& queue) {
 #ifdef __linux__
+        auto frame = vf.frame_data.frame.get();
         AVFrame *drm_frame = ff::frame_alloc();
         // Map VAAPI surface to DRM PRIME
         drm_frame->format = AV_PIX_FMT_DRM_PRIME;
@@ -698,7 +736,6 @@ public:
         };
         device.updateDescriptorSets(descriptorWrites, nullptr);
 #else
-        // Export the handle to Vulkan now!
         IDXGIResource1* dxgi_res = nullptr;
         vf.frame_data.tex->QueryInterface(IID_PPV_ARGS(&dxgi_res));
         HANDLE shared_texture_handle = nullptr;
@@ -775,6 +812,7 @@ public:
             },
         };
         device.updateDescriptorSets(descriptorWrites, nullptr);
+
 /*
         device.resetFences(*vf.copyFence);
         vk::CommandBufferBeginInfo begin_info{
@@ -820,8 +858,8 @@ public:
             .pReleaseKeys = &releaseKey,
         };*/
 /*        vk::SemaphoreSubmitInfo wait_info{
-            .semaphore = vf.mapped.semaphore,
-            .value = vf.mapped.counter,
+            .semaphore = semaphore,
+            .value = vf.frame_data.counter,
 //            .stageMask = vk::PipelineStageFlagBits2::eFragmentShader,
         };
         vk::SemaphoreSubmitInfo signal_info{
@@ -835,10 +873,10 @@ public:
 //            .pNext = &keyedMutexInfo,
             .waitSemaphoreInfoCount = 1,
             .pWaitSemaphoreInfos = &wait_info,
-            .commandBufferInfoCount = 1,
-            .pCommandBufferInfos = &cmd_info,
-            .signalSemaphoreInfoCount = 1,
-            .pSignalSemaphoreInfos = &signal_info
+//            .commandBufferInfoCount = 1,
+//            .pCommandBufferInfos = &cmd_info,
+//            .signalSemaphoreInfoCount = 1,
+//            .pSignalSemaphoreInfos = &signal_info
         };
         queue.submit2(submit_info, vf.copyFence);*/
 #endif
@@ -846,29 +884,29 @@ public:
         vf.status = VkFrame::Upload;
     }
 
-    void upload(ff::AvFrameData fd, const vk::raii::Device& device, const vk::raii::Queue& queue) {
+    int get_upload_idx() {
         auto next_idx = (frame_idx + 1) % N_INFLIGHT_VIDEO;
-        if (frames[next_idx].status == VkFrame::Ready)
-            next_idx = (next_idx + 1) % N_INFLIGHT_VIDEO;
         auto& vf = frames[next_idx];
+        if (vf.status == VkFrame::Ready || vf.status == VkFrame::Upload)
+            next_idx = (next_idx + 1) % N_INFLIGHT_VIDEO;
+        return next_idx;
+    }
+
+    void upload(ff::AvFrameData fd, const vk::raii::Device& device, const vk::raii::Queue& queue) {
+        auto& vf = frames[get_upload_idx()];
         auto err = device.waitForFences(*vf.copyFence, vk::True, 0);
         if (err != vk::Result::eSuccess) {
             return;
         }
 
         vf.frame_data = std::move(fd);
+
+        if (vf.frame_data.is_hwdec()) {
+            upmap(vf, device, queue);
+            return;
+        }
         AVFrame *frame = vf.frame_data.frame.get();
-#ifdef _WIN32
-        if (vf.frame_data.tex) {
-            upmap(vf, device, queue);
-            return;
-        }
-#else
-        if (frame->hw_frames_ctx) {
-            upmap(vf, device, queue);
-            return;
-        }
-#endif
+
         int offset[4]{};
         // Upload to Buffer:
         uint8_t *map = (uint8_t *) vf.upload_buffer_memory.mapMemory(0, upload_size);
@@ -1016,9 +1054,16 @@ public:
             vk::CommandBufferSubmitInfo cmd_info{
                 .commandBuffer = vf.commandBuffer,
             };
+            vk::SemaphoreSubmitInfo signal_info{
+                .semaphore = vf.semaphore,
+                .value = ++vf.counter,
+                .stageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+            };
             vk::SubmitInfo2 submit_info{
                 .commandBufferInfoCount = 1,
                 .pCommandBufferInfos = &cmd_info,
+                .signalSemaphoreInfoCount = 1,
+                .pSignalSemaphoreInfos = &signal_info,
             };
             queue.submit2(submit_info, vf.copyFence);
         }
@@ -1027,30 +1072,33 @@ public:
     }
 
     bool check_next_frame(double play_time, const vk::Device& device) {
-        auto next_idx = (frame_idx + 1) % N_INFLIGHT_VIDEO;
-        if (frames[next_idx].status == VkFrame::Ready)
+        int next_idx = frame_idx;
+        for (auto i = 0; i < N_INFLIGHT_VIDEO - 2; i++) {
             next_idx = (next_idx + 1) % N_INFLIGHT_VIDEO;
-        auto& vf = frames[next_idx];
-        if (vf.status == VkFrame::Upload) {
-            if (vf.frame_data.play_time <= play_time) {
-                auto err = device.waitForFences(*vf.copyFence, vk::True, 0);
-                if (err == vk::Result::eSuccess) {
+            auto& vf = frames[next_idx];
+            switch (vf.status) {
+            case VkFrame::Upload:
+                if (vf.frame_data.play_time <= play_time) {
                     vf.status = VkFrame::Ready;
+                }
+                break;
+            case VkFrame::Discard:
+                if (device.waitForFences(*vf.copyFence, vk::True, 0) == vk::Result::eSuccess) {
+                    vf.status = VkFrame::New;
                     return true;
                 }
-            }
-            return false;
-        } else if (vf.status == VkFrame::Discard) {
-            auto err = device.waitForFences(*vf.copyFence, vk::True, 0);
-            if (err == vk::Result::eSuccess) {
+                return false;
+            case VkFrame::Ready:
+                break;
+            default:
                 return true;
             }
-            return false;
         }
-        return true;
+
+        return false;
     }
 
-    const VkFrame& get_current_frame() {
+    const VkFrame& get_current_frame(const vk::raii::Device& device) {
         auto next_idx = (frame_idx + 1) % N_INFLIGHT_VIDEO;
         if (frames[next_idx].status == VkFrame::Ready) {
             frames[frame_idx].status = VkFrame::New;
@@ -1059,11 +1107,31 @@ public:
         return frames[frame_idx];
     }
 
+    void add_wait_info(std::vector<vk::SemaphoreSubmitInfo>& vector) {
+        auto& vf = frames[frame_idx];
+        if (vf.status != VkFrame::Ready)
+            return;
+#ifdef __linux__
+        if (vf.frame_data.is_hwdec())
+            return;
+#endif        
+        vector.push_back({
+#ifdef __linux__
+            .semaphore = vf.semaphore,
+            .value = vf.counter,
+#else
+            .semaphore = vf.frame_data.is_hwdec() ? semaphore : vf.semaphore,
+            .value = vf.frame_data.is_hwdec() ? vf.frame_data.counter : vf.counter,
+#endif
+            .stageMask = vk::PipelineStageFlagBits2::eFragmentShader
+        });
+    }
+
     void discard_pending() {
-        auto next_idx = (frame_idx + 1) % N_INFLIGHT_VIDEO;
-        auto& vf = frames[next_idx];
-        if (vf.status == VkFrame::Upload) {
-            vf.status = VkFrame::Discard;
+        for (auto i = 0; i < N_INFLIGHT_VIDEO; i++) {
+            if (i != frame_idx) {
+                frames[i].status = VkFrame::Discard;
+            }
         }
     }
 

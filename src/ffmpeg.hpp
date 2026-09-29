@@ -94,6 +94,42 @@ public:
     }
 };
 
+struct AVSubtitle_ : public AVSubtitle {
+    double frame_time;
+    double duration;
+};
+
+class SubtitlePool {
+protected:
+    moodycamel::ConcurrentQueue<AVSubtitle_ *> recycle_queue;
+
+public:
+    ~SubtitlePool() {
+        AVSubtitle_ *frame;
+        while (recycle_queue.try_dequeue(frame)) {
+            delete frame;
+        }
+    }
+
+    void recycle(AVSubtitle_ *frame) {
+        if (!frame)
+            return;
+        avsubtitle_free(frame);
+        recycle_queue.enqueue(frame);
+    }
+
+    AVSubtitle_ *alloc() {
+        AVSubtitle_ *frame;
+        if (recycle_queue.try_dequeue(frame))
+            return frame;
+        return new AVSubtitle_;
+    }
+};
+
+FramePool frame_pool;
+SubtitlePool sub_pool;
+
+#ifdef _WIN32
 class D3DFramePool {
 protected:
     moodycamel::ConcurrentQueue<ID3D11Texture2D *> recycle_queue;
@@ -151,41 +187,14 @@ public:
     }
 };
 
-struct AVSubtitle_ : public AVSubtitle {
-    double frame_time;
-    double duration;
-};
-
-class SubtitlePool {
-protected:
-    moodycamel::ConcurrentQueue<AVSubtitle_ *> recycle_queue;
-
-public:
-    ~SubtitlePool() {
-        AVSubtitle_ *frame;
-        while (recycle_queue.try_dequeue(frame)) {
-            delete frame;
-        }
-    }
-
-    void recycle(AVSubtitle_ *frame) {
-        if (!frame)
-            return;
-        avsubtitle_free(frame);
-        recycle_queue.enqueue(frame);
-    }
-
-    AVSubtitle_ *alloc() {
-        AVSubtitle_ *frame;
-        if (recycle_queue.try_dequeue(frame))
-            return frame;
-        return new AVSubtitle_;
-    }
-};
-
-FramePool frame_pool;
-SubtitlePool sub_pool;
 D3DFramePool d3dframe_pool;
+
+struct D3DFrameRecycler {
+    void operator()(ID3D11Texture2D *t) const {
+        d3dframe_pool.recycle(t);
+    }
+};
+#endif
 
 inline AVFrame *frame_alloc() {
     return frame_pool.alloc();
@@ -211,18 +220,21 @@ struct AvFrameDeleter {
 
 using AvFramePtr = std::unique_ptr<AVFrame, AvFrameDeleter>;
 
-struct D3DFrameRecycler {
-    void operator()(ID3D11Texture2D *t) const {
-        d3dframe_pool.recycle(t);
-    }
-};
-
 struct AvFrameData {
     AvFramePtr frame;
     double play_time;
 #ifdef _WIN32
     std::unique_ptr<ID3D11Texture2D, D3DFrameRecycler> tex;
+    UINT64 counter;
 #endif
+
+    bool is_hwdec() const {
+#ifdef _WIN32
+        return tex != nullptr;
+#else
+        return frame->hw_frames_ctx != nullptr;
+#endif
+    }
 };
 
 using time_point = std::chrono::time_point<std::chrono::steady_clock, std::chrono::duration<double>>;
@@ -735,7 +747,9 @@ public:
                                 };                                
 
                                 d3d11_context->CopySubresourceRegion(new_tex, 0, 0, 0, 0, tex, slice, &sourceBox);
+                                d3d11_context->Signal(d3d11_fence.get(), ++fence_counter);
                                 data.tex.reset(new_tex);
+                                data.counter = fence_counter;
                             } else {
                                 av_frame_move_ref(new_frame, frame);
                             }
@@ -886,8 +900,9 @@ private:
     double last_audio_time;
 
 #ifdef _WIN32
+    UINT64 fence_counter = 0;
     std::unique_ptr<ID3D11Device, D3Deleter<ID3D11Device>> d3d11_device;
-    std::unique_ptr<ID3D11DeviceContext, D3Deleter<ID3D11DeviceContext>> d3d11_context;
+    std::unique_ptr<ID3D11DeviceContext4, D3Deleter<ID3D11DeviceContext4>> d3d11_context;
 
     void init_d3d() {
         if (!d3d11_device) {
@@ -936,8 +951,24 @@ private:
             } else {
             }
     #endif
+            ID3D11DeviceContext4 *context4 = nullptr;
+            d3d11_context->QueryInterface(IID_PPV_ARGS(&context4));
+
             this->d3d11_device.reset(d3d11_device);
-            this->d3d11_context.reset(d3d11_context);
+            this->d3d11_context.reset(context4);
+            d3d11_context->Release();
+
+            ID3D11Device5* d3d11_device5 = nullptr;
+            d3d11_device->QueryInterface(IID_PPV_ARGS(&d3d11_device5));
+
+            ID3D11Fence* d3d11_fence = nullptr;
+            d3d11_device5->CreateFence(
+                fence_counter, // Initial fence value
+                D3D11_FENCE_FLAG_SHARED,
+                IID_PPV_ARGS(&d3d11_fence)
+            );
+            ::d3d11_fence.reset(d3d11_fence);
+            d3d11_device5->Release();
         }
     }
 #endif

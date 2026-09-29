@@ -185,8 +185,17 @@ public:
             .flags = vk::FenceCreateFlagBits::eSignaled,
         };
 
+        vk::SemaphoreTypeCreateInfo timelineInfo{
+            .semaphoreType = vk::SemaphoreType::eTimeline,
+            .initialValue = 0,
+        };
+        vk::SemaphoreCreateInfo semaphoreInfo{
+            .pNext = &timelineInfo
+        };
+
         for (auto i = 0; i < N_INFLIGHT_SUB; i++) {
             data.push_back({
+                .semaphore = device.createSemaphore(semaphoreInfo),
                 .copyFence = device.createFence(fence_info),
                 .set = sets[i],
                 .commandBuffer = commandBuffers[i],
@@ -271,11 +280,8 @@ public:
         if (ass_track)
             ass_flush_events(ass_track);
         
-        data[dataIdx].status = DataSet::Discard;
-        auto next_idx = (dataIdx + 1) % N_INFLIGHT_SUB;
-        auto& sd = data[next_idx];
-        if (sd.status == DataSet::Upload) {
-            sd.status = DataSet::Discard;
+        for (auto i = 0; i < N_INFLIGHT_SUB; i++) {
+            data[i].status = DataSet::Discard;
         }
     }
 
@@ -393,9 +399,15 @@ public:
         vk::CommandBufferSubmitInfo cmd_info{
             .commandBuffer = ds.commandBuffer,
         };
+        vk::SemaphoreSubmitInfo signal_info{
+            .semaphore = ds.semaphore,
+            .value = ++ds.counter
+        };
         vk::SubmitInfo2 submit_info{
             .commandBufferInfoCount = 1,
             .pCommandBufferInfos = &cmd_info,
+            .signalSemaphoreInfoCount = 1,
+            .pSignalSemaphoreInfos = &signal_info
         };
         queue.submit2(submit_info, ds.copyFence);
 
@@ -479,19 +491,24 @@ public:
             dataIdx = next_idx;
         }
         auto& ds = data[dataIdx];
-        if (ds.status != DataSet::Ready)
-            return;
-
-        if (ds.n_images == 0)
-            return;
-
-        auto err = device.waitForFences(*ds.copyFence, vk::True, 0);
-        if (err != vk::Result::eSuccess)
+        if (ds.status != DataSet::Ready || ds.n_images == 0)
             return;
 
         commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
         commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0, ds.set, nullptr);
         commandBuffer.draw(ds.vertices.size() * 6, 1, 0, 0);
+    }
+
+    void add_wait_info(std::vector<vk::SemaphoreSubmitInfo>& vector) {
+        auto& ds = data[dataIdx];
+        if (ds.status != DataSet::Ready || ds.n_images == 0)
+            return;
+
+        vector.push_back({
+            .semaphore = ds.semaphore,
+            .value = ds.counter,
+            .stageMask = vk::PipelineStageFlagBits2::eFragmentShader
+        });
     }
 
     void window_size_changed(Sint32 w, Sint32 h) {
@@ -504,24 +521,24 @@ public:
     bool check_next_frame(double play_time) {
         auto next_idx = (dataIdx + 1) % N_INFLIGHT_SUB;
         auto& ad = data[next_idx];
-        if (ad.status == DataSet::Upload) {
+        switch (ad.status) {
+        case DataSet::Upload:
             if (ad.play_time <= play_time) {
-                auto err = device.waitForFences(*ad.copyFence, vk::True, 0);
-                if (err == vk::Result::eSuccess) {
-                    ad.status = DataSet::Ready;
-                    return true;
-                }
+                ad.status = DataSet::Ready;
             }
-            return false;
-        } else if (ad.status == DataSet::Discard) {
-            auto err = device.waitForFences(*ad.copyFence, vk::True, 0);
-            if (err == vk::Result::eSuccess) {
+            break;
+        case DataSet::Discard:
+            if (device.waitForFences(*ad.copyFence, vk::True, 0) == vk::Result::eSuccess) {
+                ad.status = DataSet::New;
                 return true;
             }
             return false;
-        } else if (ad.status == DataSet::Ready) {
-            return false;
+        case DataSet::Ready:
+            break;
+        default:
+            return true;
         }
-        return true;
+
+        return false;
     }
 };

@@ -44,4 +44,6 @@ struct HandleDeleter {
         CloseHandle(t);
     }
 };
+
+std::unique_ptr<ID3D11Fence, D3Deleter<ID3D11Fence>> d3d11_fence;
 #endif
