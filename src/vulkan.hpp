@@ -78,6 +78,7 @@ private:
 	int wnd_w = 0;
 	int wnd_h = 0;
 	float base_scale = 0.0;
+	SDL_Window *window;
 
 	std::vector<const char *> getRequiredInstanceExtensions()
 	{
@@ -247,11 +248,7 @@ private:
 		vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features, vk::PhysicalDeviceVulkan12Features, vk::PhysicalDeviceVulkan13Features> featureChain = {
 			{},
 			{.samplerYcbcrConversion = true},
-			{.shaderSampledImageArrayNonUniformIndexing = true, .runtimeDescriptorArray = true,
-#ifdef _WIN32
-				.timelineSemaphore = true,
-#endif			
-			},
+			{.shaderSampledImageArrayNonUniformIndexing = true, .runtimeDescriptorArray = true, .timelineSemaphore = true,},
 		    {.synchronization2 = true, .dynamicRendering = true},        // vk::PhysicalDeviceVulkan13Features
 		};
 
@@ -530,6 +527,7 @@ public:
 	const auto& get_queue() { return queue; }
 
     bool init(SDL_Window *window) {
+		this->window = window;
         SDL_GetWindowSizeInPixels(window, &wnd_w, &wnd_h);
         SetupVulkan(window);
 		
@@ -560,16 +558,13 @@ public:
         return video.check_next_frame(play_time, device);
     }
 
-	void render_frame(const vk::CommandBuffer& commandBuffer) {
-        auto& vf = video.get_current_frame(device);
-        if (vf.status != VkFrame::Ready)
-            return;
+	void draw_frame(const vk::CommandBuffer& commandBuffer, std::vector<vk::SemaphoreSubmitInfo>& vector) {
+		if (!video.predraw(commandBuffer, vector))
+			return;
 
-        commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, video.pipeline);
-		commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, video.pipelineLayout, 0, vf.set, nullptr);
-        auto scale = base_scale * video_scale;
-		float w = 2.0f * scale * vf.frame_data.frame->width / wnd_w;
-		float h = 2.0f * scale * vf.frame_data.frame->height / wnd_h;
+		auto scale = base_scale * video_scale;
+		float w = 2.0f * scale * video.width / wnd_w;
+		float h = 2.0f * scale * video.height / wnd_h;
 		Vertform tf = {
 			.position = { video_pan_x / wnd_w, video_pan_y / wnd_h },
 			.size = { w, h }
@@ -609,6 +604,13 @@ public:
 		}
 //		updateUniformBuffer(frameIndex);
 
+		std::vector<vk::SemaphoreSubmitInfo> wait_info;
+		wait_info.reserve(3);
+		wait_info.push_back({
+			.semaphore = presentCompleteSemaphores[frameIndex],
+			.stageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+		});
+
 		// Only reset the fence if we are submitting work
 		device.resetFences(*inFlightFences[frameIndex]);
         auto commandBuffer = *commandBuffers[frameIndex];
@@ -643,10 +645,10 @@ public:
 
 		commandBuffer.setViewport(0, vk::Viewport(0.0f, static_cast<float>(swapChainExtent.height), static_cast<float>(swapChainExtent.width), -static_cast<float>(swapChainExtent.height), 0.0f, 1.0f));
 		commandBuffer.setScissor(0, vk::Rect2D(vk::Offset2D(0, 0), swapChainExtent));
-		render_frame(commandBuffer);
+		draw_frame(commandBuffer, wait_info);
 		std::visit([&](auto&& sub){
 			if (sub)
-				sub->draw(commandBuffer);
+				sub->draw(commandBuffer, wait_info);
 		}, sub);
         ImGui_ImplVulkan_RenderDrawData(draw_data, commandBuffer);
 
@@ -667,17 +669,6 @@ public:
         vk::CommandBufferSubmitInfo cmd_info{
             .commandBuffer = commandBuffers[frameIndex],
         };
-		std::vector<vk::SemaphoreSubmitInfo> wait_info;
-		wait_info.reserve(3);
-		wait_info.push_back({
-			.semaphore = presentCompleteSemaphores[frameIndex],
-			.stageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-		});
-		video.add_wait_info(wait_info);
-		std::visit([&](auto&& sub){
-			if (sub)
-				sub->add_wait_info(wait_info);
-		}, sub);
 		vk::SemaphoreSubmitInfo signal_info{
 			.semaphore = renderFinishedSemaphores[imageIndex],
 		};
@@ -719,6 +710,7 @@ public:
     }
 
     void reset_scale() {
+		SDL_GetWindowSizeInPixels(window, &wnd_w, &wnd_h);
 		base_scale = SDL_max((float) wnd_w / video.width, (float) wnd_h / video.height);
     }
 

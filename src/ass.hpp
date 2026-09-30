@@ -67,7 +67,7 @@ private:
 		std::vector<vk::DynamicState>      dynamicStates = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
 		vk::PipelineDynamicStateCreateInfo dynamicState{.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size()), .pDynamicStates = dynamicStates.data()};
 
-		vk::PipelineLayoutCreateInfo pipelineLayoutInfo{.setLayoutCount = 1, .pSetLayouts = &*layout, .pushConstantRangeCount = 0, .pPushConstantRanges = {}};
+		vk::PipelineLayoutCreateInfo pipelineLayoutInfo{.setLayoutCount = 1, .pSetLayouts = &*layout};
 		pipelineLayout = vk::raii::PipelineLayout(device, pipelineLayoutInfo);
 
 		vk::StructureChain<vk::GraphicsPipelineCreateInfo, vk::PipelineRenderingCreateInfo> pipelineCreateInfoChain = {
@@ -484,7 +484,7 @@ public:
         ds.play_time = play_time;
     }
 
-    void draw(const vk::CommandBuffer commandBuffer) {
+    void draw(const vk::CommandBuffer commandBuffer, std::vector<vk::SemaphoreSubmitInfo>& vector) {
         auto next_idx = (dataIdx + 1) % N_INFLIGHT_SUB;
         if (data[next_idx].status == DataSet::Ready) {
             data[dataIdx].status = DataSet::New;
@@ -497,12 +497,6 @@ public:
         commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
         commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0, ds.set, nullptr);
         commandBuffer.draw(ds.vertices.size() * 6, 1, 0, 0);
-    }
-
-    void add_wait_info(std::vector<vk::SemaphoreSubmitInfo>& vector) {
-        auto& ds = data[dataIdx];
-        if (ds.status != DataSet::Ready || ds.n_images == 0)
-            return;
 
         vector.push_back({
             .semaphore = ds.semaphore,

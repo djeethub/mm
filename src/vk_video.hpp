@@ -1098,23 +1098,24 @@ public:
         return false;
     }
 
-    const VkFrame& get_current_frame(const vk::raii::Device& device) {
+    bool predraw(const vk::CommandBuffer& commandBuffer, std::vector<vk::SemaphoreSubmitInfo>& vector) {
         auto next_idx = (frame_idx + 1) % N_INFLIGHT_VIDEO;
         if (frames[next_idx].status == VkFrame::Ready) {
             frames[frame_idx].status = VkFrame::New;
             frame_idx = next_idx;
         }
-        return frames[frame_idx];
-    }
-
-    void add_wait_info(std::vector<vk::SemaphoreSubmitInfo>& vector) {
         auto& vf = frames[frame_idx];
         if (vf.status != VkFrame::Ready)
-            return;
+            return false;
+
+        commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+		commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0, vf.set, nullptr);
+
 #ifdef __linux__
         if (vf.frame_data.is_hwdec())
-            return;
+            return true;
 #endif        
+
         vector.push_back({
 #ifdef __linux__
             .semaphore = vf.semaphore,
@@ -1125,6 +1126,8 @@ public:
 #endif
             .stageMask = vk::PipelineStageFlagBits2::eFragmentShader
         });
+
+        return true;
     }
 
     void discard_pending() {
