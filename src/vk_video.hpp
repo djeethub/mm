@@ -81,6 +81,8 @@ private:
     vk::raii::DescriptorSetLayout layout = nullptr;
     vk::raii::DescriptorPool pool = nullptr;
     vk::raii::CommandPool commandPool = nullptr;
+    vk::raii::PipelineLayout pipelineLayout = nullptr;
+    vk::raii::Pipeline pipeline = nullptr;
 
     VkFrame frames[N_INFLIGHT_VIDEO];
     int frame_idx = 0;
@@ -227,8 +229,7 @@ public:
     AVPixelFormat pix_fmt = AV_PIX_FMT_NONE;
 	int width;
 	int height;
-    vk::raii::PipelineLayout pipelineLayout = nullptr;
-    vk::raii::Pipeline pipeline = nullptr;
+	Vertform vert;
 
     void init_once(const vk::raii::Device& device) {
         vk::CommandPoolCreateInfo poolInfo = {
@@ -1098,7 +1099,7 @@ public:
         return false;
     }
 
-    bool predraw(const vk::CommandBuffer& commandBuffer, std::vector<vk::SemaphoreSubmitInfo>& vector) {
+    void draw(const vk::CommandBuffer& commandBuffer, std::vector<vk::SemaphoreSubmitInfo>& vector) {
         auto next_idx = (frame_idx + 1) % N_INFLIGHT_VIDEO;
         if (frames[next_idx].status == VkFrame::Ready) {
             frames[frame_idx].status = VkFrame::New;
@@ -1106,16 +1107,17 @@ public:
         }
         auto& vf = frames[frame_idx];
         if (vf.status != VkFrame::Ready)
-            return false;
+            return;
 
         commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
 		commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0, vf.set, nullptr);
+        commandBuffer.pushConstants(pipelineLayout, vk::ShaderStageFlagBits::eVertex, 0, sizeof(vert), &vert);
+		commandBuffer.draw(4, 1, 0, 0);
 
 #ifdef __linux__
         if (vf.frame_data.is_hwdec())
-            return true;
+            return;
 #endif        
-
         vector.push_back({
 #ifdef __linux__
             .semaphore = vf.semaphore,
@@ -1126,8 +1128,6 @@ public:
 #endif
             .stageMask = vk::PipelineStageFlagBits2::eFragmentShader
         });
-
-        return true;
     }
 
     void discard_pending() {

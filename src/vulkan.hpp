@@ -558,21 +558,6 @@ public:
         return video.check_next_frame(play_time, device);
     }
 
-	void draw_frame(const vk::CommandBuffer& commandBuffer, std::vector<vk::SemaphoreSubmitInfo>& vector) {
-		if (!video.predraw(commandBuffer, vector))
-			return;
-
-		auto scale = base_scale * video_scale;
-		float w = 2.0f * scale * video.width / wnd_w;
-		float h = 2.0f * scale * video.height / wnd_h;
-		Vertform tf = {
-			.position = { video_pan_x / wnd_w, video_pan_y / wnd_h },
-			.size = { w, h }
-		};
-        commandBuffer.pushConstants(video.pipelineLayout, vk::ShaderStageFlagBits::eVertex, 0, sizeof(tf), &tf);
-		commandBuffer.draw(4, 1, 0, 0);
-	}
-
 	void render(AppSub sub)
 	{
         ImDrawData* draw_data = ImGui::GetDrawData();
@@ -645,7 +630,7 @@ public:
 
 		commandBuffer.setViewport(0, vk::Viewport(0.0f, static_cast<float>(swapChainExtent.height), static_cast<float>(swapChainExtent.width), -static_cast<float>(swapChainExtent.height), 0.0f, 1.0f));
 		commandBuffer.setScissor(0, vk::Rect2D(vk::Offset2D(0, 0), swapChainExtent));
-		draw_frame(commandBuffer, wait_info);
+		video.draw(commandBuffer, wait_info);
 		std::visit([&](auto&& sub){
 			if (sub)
 				sub->draw(commandBuffer, wait_info);
@@ -703,16 +688,41 @@ public:
         frameIndex = (frameIndex + 1) % MAX_FRAMES_IN_FLIGHT;
 	}
 
+	void transform_changed() {
+		auto scale = base_scale * video_scale;
+		video.vert = {
+			.position = { video_pan_x / wnd_w, video_pan_y / wnd_h },
+			.size = { 2.0f * scale * video.width / wnd_w,
+					2.0f * scale * video.height / wnd_h }
+		};
+	}
+
 	void window_size_changed(Sint32 w, Sint32 h) {
         wnd_w = w;
         wnd_h = h;
         framebufferResized = true;
+		transform_changed();
     }
 
     void reset_scale() {
 		SDL_GetWindowSizeInPixels(window, &wnd_w, &wnd_h);
 		base_scale = SDL_max((float) wnd_w / video.width, (float) wnd_h / video.height);
+		transform_changed();
     }
+
+	void set_transform(float scale, float x, float y) {
+		video_scale += scale;
+		video_pan_x += x;
+		video_pan_y += y;
+		transform_changed();
+	}
+
+	void reset_transform() {
+		video_scale = 1.0;
+		video_pan_x = 0.0;
+		video_pan_y = 0.0;
+		transform_changed();
+	}
 
     void wait_for_idle() {
         device.waitIdle();
