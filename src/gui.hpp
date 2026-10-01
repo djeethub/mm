@@ -3,21 +3,29 @@
 #include <string>
 #include <format>
 
+#define IMGUI_IMPL_VULKAN_HAS_DYNAMIC_RENDERING
+#include <imgui.h>
+#include <imgui_impl_sdl3.h>
+#include <imgui_impl_vulkan.h>
+
 //#include <fontconfig/fontconfig.h>
 
-#include "appstate.hpp"
-
 class AppGui {
-public:
-    AppGui() = default;
+private:
+    std::string noti_text;
+    uint64_t text_expires_at = 0; // Expiration time in SDL ticks (milliseconds)
+    std::string subtitle;
+    uint64_t subtitle_expires_at = 0;
+    uint64_t slider_expires_at = 0;
+    ImFont* osdFont = nullptr;
+    ImFont* uiFont  = nullptr;
+//        ImFont* subtitleFont  = nullptr;
 
+public:
     void shutdown() {
-        if (state) {
-            state = nullptr;
-            ImGui_ImplVulkan_Shutdown();
-            ImGui_ImplSDL3_Shutdown();
-            ImGui::DestroyContext();
-        }
+        ImGui_ImplVulkan_Shutdown();
+        ImGui_ImplSDL3_Shutdown();
+        ImGui::DestroyContext();
     }
 /*
     static std::string search_font_linux(const char* family_name, const char* style_name) {
@@ -66,10 +74,8 @@ public:
         return out_path;
     }        
 */
-    void init(AppState *state)
+    void init(SDL_Window *window, ImGui_ImplVulkan_InitInfo& init_info)
     {
-        AppGui::state = state;
-
         // Initialize Dear ImGui Context
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
@@ -84,8 +90,10 @@ public:
         style.FontScaleDpi = main_scale;        // Set initial font scale. (in docking branch: using io.ConfigDpiScaleFonts=true automatically overrides this for every window depending on the current monitor)
 
         // Setup Platform/Renderer backends
-        ImGui_ImplSDL3_InitForVulkan(state->window);
-        state->gpu.imgui_init(2);
+        ImGui_ImplSDL3_InitForVulkan(window);
+        init_info.MinImageCount = 2;
+        ImGui_ImplVulkan_Init(&init_info);
+        ImGui_ImplVulkan_SetMinImageCount(init_info.MinImageCount);
 
         // 3. Load the fonts from your local system or project directory
         // Arguments: (Filepath, Font Size in pixels, Config Struct, Glyph Ranges)
@@ -142,7 +150,8 @@ public:
             return std::format("{} ({})##{}", data.title, data.lang, data.idx);
     }
 
-    SDL_AppResult draw()
+    template <typename Seek, typename Menu>
+    void draw(Seek seek, Menu menu)
     {
         auto curr_ticks = SDL_GetTicks();
         ImGuiIO &io = ImGui::GetIO();
@@ -170,29 +179,6 @@ public:
             );
             ImGui::PopFont();
         }
-/*
-        if (subtitle_expires_at > curr_ticks)
-        {
-            ImDrawList* draw_list = ImGui::GetBackgroundDrawList();
-            ImGui::PushFont(subtitleFont);
-            ImVec2 text_size = ImGui::CalcTextSize(subtitle.c_str(), NULL, false, io.DisplaySize.x * 0.9);
-            ImVec2 pos = ImVec2(
-                    (io.DisplaySize.x - text_size.x) * 0.5f,           // center X
-                    io.DisplaySize.y - text_size.y - io.DisplaySize.y * 0.08             // bottom with padding
-                );                
-
-            DrawTextWithShadow(
-                draw_list, 
-                ImGui::GetFont(), 
-                ImGui::GetFontSize(),
-                pos, 
-                subtitle.c_str(), 
-                IM_COL32(255, 255, 255, 255),
-                IM_COL32(0, 0, 0, 200),
-                2, text_size.x
-            );
-            ImGui::PopFont();
-        }*/
 
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5, io.DisplaySize.y * 0.9), 0, ImVec2(0.5, 0.5));
         auto size = ImVec2(io.DisplaySize.x * 0.92, io.DisplaySize.y * 0.1);
@@ -204,14 +190,8 @@ public:
                     ImGuiWindowFlags_NoFocusOnAppearing |
                     ImGuiWindowFlags_NoNav |
                     ImGuiWindowFlags_NoMove);
-        auto duration = state->video.get_duration();
-        if (state->media_mode == Sound || (ImGui::IsWindowHovered() && duration > 0.05)) {
-            auto play_time = state->get_play_time();
-            float v = play_time / duration;
-            ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::SliderFloat("##Seek", &v, 0.0f, 1.0f, std::format("{} / {}", time_str(play_time), time_str(duration - play_time)).c_str())) {
-                state->seek_ratio(v);
-            }
+        if (ImGui::IsWindowHovered()) {
+            seek();
         }
         ImGui::End();
 
@@ -220,79 +200,12 @@ public:
         }
         if (ImGui::BeginPopup("mymenu"))
         {
-/*                
-            if (ImGui::MenuItem("Next File", ".", false, state->image_files.size() > 1))
-            {
-                if (state->open_next_file(true))
-                    show_noti(state->get_file_name());
-            }
-            if (ImGui::MenuItem("Previous File", ",", false, state->image_files.size() > 1))
-            {
-                if (state->open_next_file(false))
-                    show_noti(state->get_file_name());
-            }*/
-            if (ImGui::MenuItem(state->video.is_paused ? "Resume" : "Pause", "Space", false, true))
-            {
-                state->pause();
-                show_noti(state->video.is_paused ? "Paused" : "Resumed");
-                if (state->video.is_paused) {
-                    SDL_Event event{ .type = SDL_EVENT_FIRST };
-                    SDL_PushEvent(&event);
-                }
-            }
-            if (ImGui::MenuItem("Minimize", "F9", false, true))
-            {
-                SDL_MinimizeWindow(state->window);
-                state->pause(true);
-            }
-            if (ImGui::BeginMenu("Audio"))
-            {
-                auto idx = state->video.get_audio_index();
-                if (ImGui::MenuItem("None", nullptr, idx < 0, true))
-                {
-                    state->select_audio(-1);
-                }
-                ImGui::Separator();
-                auto tracks = state->video.get_audio_tracks();
-                for (const auto& data : tracks) {
-                    if (ImGui::MenuItem(label(data).c_str(), nullptr, data.idx == idx, true))
-                    {
-                        state->select_audio(data.idx);
-                    }
-                }
-                ImGui::EndMenu();
-            }
-            if (ImGui::BeginMenu("Subtitles"))
-            {
-                auto idx = state->video.get_subtitle_index();
-                if (ImGui::MenuItem("None", nullptr, idx < 0, true))
-                {
-                    state->select_subtitle(-1);
-                }
-                ImGui::Separator();
-                auto tracks = state->video.get_subtitle_tracks();
-                for (const auto& data : tracks) {
-                    if (ImGui::MenuItem(label(data).c_str(), nullptr, data.idx == idx, true))
-                    {
-                        state->select_subtitle(data.idx);
-                    }
-                }
-                ImGui::EndMenu();
-            }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Open File Location", "Ctrl+L")) {
-                state->open_file_location();
-            }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Exit", "Esc")) {
-                return SDL_APP_SUCCESS;
-            }
+            menu();
             ImGui::EndPopup();
         }
 
         ImGui::Render();
 //            ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), state->renderer.get());
-        return SDL_APP_CONTINUE;
     }
 
     void show_noti(const std::string &message, uint64_t duration_ms = 2000)
@@ -306,15 +219,4 @@ public:
         subtitle = message;
         subtitle_expires_at = SDL_GetTicks() + duration_ms;
     }
-
-private:
-    AppState *state = nullptr;
-    std::string noti_text;
-    uint64_t text_expires_at = 0; // Expiration time in SDL ticks (milliseconds)
-    std::string subtitle;
-    uint64_t subtitle_expires_at = 0;
-    uint64_t slider_expires_at = 0;
-    ImFont* osdFont = nullptr;
-    ImFont* uiFont  = nullptr;
-//        ImFont* subtitleFont  = nullptr;
 };

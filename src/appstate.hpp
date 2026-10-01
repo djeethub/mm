@@ -14,6 +14,7 @@
 #include "subtitle.hpp"
 #include "ass.hpp"
 #include "vulkan.hpp"
+#include "gui.hpp"
 //#include "sub_bitmap.hpp"
 #include "readerwriterqueue.h"
 
@@ -60,6 +61,7 @@ public:
     ff::VideoFile video;
     AppVk gpu;
     AppSub app_sub;
+    AppGui gui;
     std::vector<ff::ChapterData> chapter_list;
     bool is_seeking = false;
     bool is_loop = true;
@@ -76,7 +78,13 @@ public:
         window = SDL_CreateWindow("mm", 480, 240, window_flags | SDL_WINDOW_VULKAN);
         if (!window) { return false; }
 
-        return gpu.init(window);
+        if (!gpu.init(window))
+            return false;
+
+        ImGui_ImplVulkan_InitInfo imgui_info = {};
+        gpu.fill_init_info(imgui_info);
+        gui.init(window, imgui_info);
+        return true;
     }
 
     static MediaMode is_supported_format(const fs::path &p, MediaMode mode = None) {
@@ -138,7 +146,7 @@ public:
         sub_type = SUBTITLE_NONE;
     }
 
-    bool shutdown() {
+    void shutdown() {
         video.stop_thead();
         reset_runtime_state();
         std::visit([](auto&& sub){
@@ -147,7 +155,7 @@ public:
                 sub = nullptr;
             }
         }, app_sub);
-        return true;
+        gui.shutdown();
     }
 
     static DirData *dir_worker(const std::string file_path, MediaMode mode) {
@@ -654,6 +662,81 @@ public:
             is_playing = play;
             SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, play ? "0" : "waitevent");
         }
+    }
+
+    SDL_AppResult draw_gui() {
+        SDL_AppResult result = SDL_APP_CONTINUE;
+
+        gui.draw([&](){
+            auto duration = video.get_duration();
+            if (duration > 0.5) {
+                auto play_time = get_play_time();
+                float v = play_time / duration;
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::SliderFloat("##Seek", &v, 0.0f, 1.0f, std::format("{} / {}", gui.time_str(play_time), gui.time_str(duration - play_time)).c_str())) {
+                    seek_ratio(v);
+                }
+            }
+        }, [&](){
+            if (ImGui::MenuItem(video.is_paused ? "Resume" : "Pause", "Space", false, true))
+            {
+                pause();
+                gui.show_noti(video.is_paused ? "Paused" : "Resumed");
+                if (video.is_paused) {
+                    SDL_Event event{ .type = SDL_EVENT_FIRST };
+                    SDL_PushEvent(&event);
+                }
+            }
+            if (ImGui::MenuItem("Minimize", "F9", false, true))
+            {
+                SDL_MinimizeWindow(window);
+                pause(true);
+            }
+            if (ImGui::BeginMenu("Audio"))
+            {
+                auto idx = video.get_audio_index();
+                if (ImGui::MenuItem("None", nullptr, idx < 0, true))
+                {
+                    select_audio(-1);
+                }
+                ImGui::Separator();
+                auto tracks = video.get_audio_tracks();
+                for (const auto& data : tracks) {
+                    if (ImGui::MenuItem(gui.label(data).c_str(), nullptr, data.idx == idx, true))
+                    {
+                        select_audio(data.idx);
+                    }
+                }
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Subtitles"))
+            {
+                auto idx = video.get_subtitle_index();
+                if (ImGui::MenuItem("None", nullptr, idx < 0, true))
+                {
+                    select_subtitle(-1);
+                }
+                ImGui::Separator();
+                auto tracks = video.get_subtitle_tracks();
+                for (const auto& data : tracks) {
+                    if (ImGui::MenuItem(gui.label(data).c_str(), nullptr, data.idx == idx, true))
+                    {
+                        select_subtitle(data.idx);
+                    }
+                }
+                ImGui::EndMenu();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Open File Location", "Ctrl+L")) {
+                open_file_location();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Exit", "Esc")) {
+                result = SDL_APP_SUCCESS;
+            }
+        });
+
+        return result;
     }
 
     void render() {

@@ -5,13 +5,8 @@
 #define SDL_MAIN_USE_CALLBACKS 1
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
-#define IMGUI_IMPL_VULKAN_HAS_DYNAMIC_RENDERING
-#include <imgui.h>
-#include <imgui_impl_sdl3.h>
-#include <imgui_impl_vulkan.h>
 
 #include "appstate.hpp"
-#include "gui.hpp"
 
 constexpr int BORDER_SIZE = 5;
 #define PAN_N   5
@@ -43,8 +38,6 @@ static SDL_HitTestResult SDLCALL WindowHitTest(SDL_Window *win, const SDL_Point 
 #endif
 }
 
-AppGui gui;
-
 SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
     if (argc < 2 || !argv[1]) {
         SDL_Log("Usage: %s <media_file>", argv[0]);
@@ -62,7 +55,6 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
         return SDL_APP_FAILURE;
 
     if (!state->open_file(argv[1])) { return SDL_APP_FAILURE; }
-    gui.init(state);
     SDL_ShowWindow(state->window);
     SDL_SetWindowHitTest(state->window, WindowHitTest, nullptr);
     return SDL_APP_CONTINUE;
@@ -70,6 +62,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
 
 SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
     auto *state = static_cast<AppState*>(appstate);
+    AppGui& gui = state->gui;
     ImGui_ImplSDL3_ProcessEvent(event);
 
     switch (event->type) {
@@ -264,7 +257,7 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
 SDL_AppResult SDL_AppIterate(void *appstate) {
     auto *state = static_cast<AppState*>(appstate);
 
-    auto app_result = gui.draw();
+    auto app_result = state->draw_gui();
     if (app_result != SDL_APP_CONTINUE)
         return app_result;
 
@@ -278,7 +271,6 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result) {
         SDL_SetWindowHitTest(state->window, nullptr, nullptr);
         state->gpu.wait_for_idle();
         state->shutdown();
-        gui.shutdown();
         delete state;
     }
 }

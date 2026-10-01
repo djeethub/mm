@@ -252,7 +252,7 @@ public:
         vk::DescriptorPoolCreateInfo pool_info{
 //            .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
             .maxSets = N_INFLIGHT_VIDEO,
-            .poolSizeCount = (uint32_t)IM_COUNTOF(pool_sizes),
+            .poolSizeCount = std::size(pool_sizes),
             .pPoolSizes = pool_sizes
         };
         pool = device.createDescriptorPool(pool_info);

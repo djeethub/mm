@@ -7,6 +7,7 @@
 
 #include "vk_video.hpp"
 #include "subtitle.hpp"
+#include "gui.hpp"
 
 #define MAX_FRAMES_IN_FLIGHT	2
 
@@ -418,74 +419,6 @@ private:
         memProperties = physicalDevice.getMemoryProperties();
     }
 
-    VkSurfaceFormatKHR SelectSurfaceFormat(const vk::raii::PhysicalDevice& physical_device, const vk::raii::SurfaceKHR& surface, const vk::Format* request_formats, int request_formats_count, vk::ColorSpaceKHR request_color_space)
-    {
-//        IM_ASSERT(g_FunctionsLoaded && "Need to call ImGui_ImplVulkan_LoadFunctions() if IMGUI_IMPL_VULKAN_NO_PROTOTYPES or VK_NO_PROTOTYPES are set!");
-        IM_ASSERT(request_formats != nullptr);
-        IM_ASSERT(request_formats_count > 0);
-
-        // Per Spec Format and View Format are expected to be the same unless VK_IMAGE_CREATE_MUTABLE_BIT was set at image creation
-        // Assuming that the default behavior is without setting this bit, there is no need for separate Swapchain image and image view format
-        // Additionally several new color spaces were introduced with Vulkan Spec v1.0.40,
-        // hence we must make sure that a format with the mostly available color space, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR, is found and used.
-        auto avail_format = physical_device.getSurfaceFormatsKHR(surface);
-
-        // First check if only one format, VK_FORMAT_UNDEFINED, is available, which would imply that any format is available
-        if (avail_format.size() == 1)
-        {
-            if (avail_format[0].format == vk::Format::eUndefined)
-            {
-                vk::SurfaceFormatKHR ret;
-                ret.format = request_formats[0];
-                ret.colorSpace = request_color_space;
-                return ret;
-            }
-            else
-            {
-                // No point in searching another format
-                return avail_format[0];
-            }
-        }
-        else
-        {
-            // Request several formats, the first found will be used
-            for (int request_i = 0; request_i < request_formats_count; request_i++)
-                for (uint32_t avail_i = 0; avail_i < avail_format.size(); avail_i++)
-                    if (avail_format[avail_i].format == request_formats[request_i] && avail_format[avail_i].colorSpace == request_color_space)
-                        return avail_format[avail_i];
-
-            // If none of the requested image formats could be found, use the first available
-            return avail_format[0];
-        }
-    }
-
-    vk::PresentModeKHR SelectPresentMode(const vk::raii::PhysicalDevice& physical_device, const vk::raii::SurfaceKHR& surface, const vk::PresentModeKHR* request_modes, int request_modes_count)
-    {
-//        IM_ASSERT(g_FunctionsLoaded && "Need to call ImGui_ImplVulkan_LoadFunctions() if IMGUI_IMPL_VULKAN_NO_PROTOTYPES or VK_NO_PROTOTYPES are set!");
-        IM_ASSERT(request_modes != nullptr);
-        IM_ASSERT(request_modes_count > 0);
-
-        // Request a certain mode and confirm that it is available. If not use VK_PRESENT_MODE_FIFO_KHR which is mandatory
-        auto avail_modes = physical_device.getSurfacePresentModesKHR(surface);
-        //for (uint32_t avail_i = 0; avail_i < avail_count; avail_i++)
-        //    printf("[vulkan] avail_modes[%d] = %d\n", avail_i, avail_modes[avail_i]);
-
-        for (int request_i = 0; request_i < request_modes_count; request_i++)
-            for (uint32_t avail_i = 0; avail_i < avail_modes.size(); avail_i++)
-                if (request_modes[request_i] == avail_modes[avail_i])
-                    return request_modes[request_i];
-
-        return vk::PresentModeKHR::eFifo; // Always available
-    }
-
-    static bool IsExtensionAvailable(const std::vector<vk::ExtensionProperties> properties, const char* extension)
-    {
-        for (const auto& p : properties)
-            if (strcmp(p.extensionName, extension) == 0)
-                return true;
-        return false;
-    }
-
 	void transition_image_layout(
 	    uint32_t                imageIndex,
 	    vk::ImageLayout         old_layout,
@@ -728,8 +661,7 @@ public:
         device.waitIdle();
     }
 
-    void imgui_init(int min_image_count) {
-        ImGui_ImplVulkan_InitInfo init_info = {};
+    void fill_init_info(ImGui_ImplVulkan_InitInfo& init_info) {
         init_info.ApiVersion = VK_API_VERSION_1_4;              // Pass in your value of VkApplicationInfo::apiVersion, otherwise will default to header version.
         init_info.Instance = *instance;
         init_info.PhysicalDevice = *physicalDevice;
@@ -739,7 +671,7 @@ public:
         init_info.PipelineCache = VK_NULL_HANDLE;
 //        init_info.DescriptorPool = *descriptorPool;
         init_info.DescriptorPoolSize = IMGUI_IMPL_VULKAN_MINIMUM_SAMPLED_IMAGE_POOL_SIZE;
-        init_info.MinImageCount = min_image_count;
+//        init_info.MinImageCount = min_image_count;
         init_info.ImageCount = swapChainImages.size();
         init_info.Allocator = nullptr;
         init_info.PipelineInfoMain.RenderPass = VK_NULL_HANDLE;
@@ -754,8 +686,6 @@ public:
             .depthAttachmentFormat = VK_FORMAT_UNDEFINED,
             .stencilAttachmentFormat = VK_FORMAT_UNDEFINED,
         };
-        ImGui_ImplVulkan_Init(&init_info);
-        ImGui_ImplVulkan_SetMinImageCount(min_image_count);
     }
 
 	void discard_pending() {
