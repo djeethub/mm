@@ -69,6 +69,11 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
         case SDL_EVENT_QUIT:
             return SDL_APP_SUCCESS;
 
+        case SDL_EVENT_MOUSE_MOTION:
+            state->action_tp = std::chrono::steady_clock::now();
+            SDL_ShowCursor();
+            break;
+
         case SDL_EVENT_MOUSE_WHEEL:
             if (!ImGui::GetIO().WantCaptureMouse) {
                 if (event->wheel.y < 0) {

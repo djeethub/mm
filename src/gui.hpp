@@ -196,16 +196,15 @@ public:
         ImGui::End();
 
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-            ImGui::OpenPopup("mymenu");
+            ImGui::OpenPopup("ctx");
         }
-        if (ImGui::BeginPopup("mymenu"))
+        if (ImGui::BeginPopup("ctx"))
         {
             menu();
             ImGui::EndPopup();
         }
 
         ImGui::Render();
-//            ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), state->renderer.get());
     }
 
     void show_noti(const std::string &message, uint64_t duration_ms = 2000)

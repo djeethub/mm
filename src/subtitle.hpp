@@ -81,7 +81,7 @@ struct ImageData {
     }
 };
 
-struct DataSet {
+struct ImageSet {
     enum Status {
         None,
         New,

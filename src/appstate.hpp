@@ -18,7 +18,8 @@
 //#include "sub_bitmap.hpp"
 #include "readerwriterqueue.h"
 
-const auto LARGE_INTERVAL = 777777.7;
+constexpr auto LARGE_INTERVAL = 777777.7;
+constexpr auto N_IDLE_DELAY = 1.0;
 
 namespace fs = std::filesystem;
 
@@ -66,6 +67,7 @@ public:
     bool is_seeking = false;
     bool is_loop = true;
     MediaMode media_mode;
+    ff::time_point action_tp;
     
     ~AppState() {
         gpu.shutdown();
@@ -743,7 +745,8 @@ public:
         if (!video.is_paused) {
             check_audio_frame();
             check_subtitle();
-            auto play_time = get_play_time();
+            ff::time_point now = std::chrono::steady_clock::now();
+            auto play_time = video.get_play_time(now);
             while (gpu.check_next_frame(play_time)) {
                 ff::AvFrameData data = fetch_video_frame(play_time);
                 if (data.frame) {
@@ -766,6 +769,10 @@ public:
                         sub->prepare_draw(gpu.get_queue(), play_time);
                 }
             }, app_sub);
+
+            if (!ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopup) && (now - action_tp).count() > N_IDLE_DELAY) {
+                SDL_HideCursor();
+            }
         }
 
         gpu.render(app_sub);

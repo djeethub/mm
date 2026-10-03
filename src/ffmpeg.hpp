@@ -816,11 +816,15 @@ public:
     }
 
     static inline double elapsed_time(time_point to, time_point from) {
-        return std::chrono::duration<double>(to - from).count();
+        return (to - from).count();
     }
 
     static inline double elapsed_time(time_point from) {
         return elapsed_time(std::chrono::steady_clock::now(), from);
+    }
+
+    inline double get_play_time(time_point now) const {
+        return elapsed_time(now, shared_tp.load(std::memory_order_relaxed));
     }
 
     inline double get_play_time() const {

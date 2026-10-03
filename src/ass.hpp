@@ -9,8 +9,8 @@
 
 class SubAss : public AppSubtitle {
 private:
-    std::vector<DataSet> data;
-    int dataIdx = 0;
+    ImageSet frames[N_INFLIGHT_SUB];
+    int frame_idx = 0;
 
     ASS_Library *ass_library = nullptr;
     ASS_Renderer *ass_renderer = nullptr;
@@ -194,12 +194,12 @@ public:
         };
 
         for (auto i = 0; i < N_INFLIGHT_SUB; i++) {
-            data.push_back({
+            frames[i] = {
                 .semaphore = device.createSemaphore(semaphoreInfo),
                 .copyFence = device.createFence(fence_info),
                 .set = sets[i],
                 .commandBuffer = commandBuffers[i],
-            });
+            };
         }
 
         createGraphicsPipeline(device, swapChainSurfaceFormat.format);
@@ -281,7 +281,7 @@ public:
             ass_flush_events(ass_track);
         
         for (auto i = 0; i < N_INFLIGHT_SUB; i++) {
-            data[i].status = DataSet::Discard;
+            frames[i].status = ImageSet::Discard;
         }
     }
 
@@ -295,7 +295,7 @@ public:
         );
     }
 
-    void upload_data(DataSet& ds, const vk::raii::Queue& queue) {
+    void upload_data(ImageSet& ds, const vk::raii::Queue& queue) {
         if (ds.n_images == 0)
             return;
 
@@ -429,8 +429,8 @@ public:
         if (!ass_track)
             return;
 
-        auto next_idx = (dataIdx + 1) % N_INFLIGHT_SUB;
-        auto& ds = data[next_idx];
+        auto next_idx = (frame_idx + 1) % N_INFLIGHT_SUB;
+        auto& ds = frames[next_idx];
         auto err = device.waitForFences(*ds.copyFence, vk::True, 0);
         if (err != vk::Result::eSuccess)
             return;
@@ -480,18 +480,18 @@ public:
         ds.n_images = idx;
 
         upload_data(ds, queue);
-        ds.status = DataSet::Upload;
+        ds.status = ImageSet::Upload;
         ds.play_time = play_time;
     }
 
     void draw(const vk::CommandBuffer commandBuffer, std::vector<vk::SemaphoreSubmitInfo>& vector) {
-        auto next_idx = (dataIdx + 1) % N_INFLIGHT_SUB;
-        if (data[next_idx].status == DataSet::Ready) {
-            data[dataIdx].status = DataSet::New;
-            dataIdx = next_idx;
+        auto next_idx = (frame_idx + 1) % N_INFLIGHT_SUB;
+        if (frames[next_idx].status == ImageSet::Ready) {
+            frames[frame_idx].status = ImageSet::New;
+            frame_idx = next_idx;
         }
-        auto& ds = data[dataIdx];
-        if (ds.status != DataSet::Ready || ds.n_images == 0)
+        auto& ds = frames[frame_idx];
+        if (ds.status != ImageSet::Ready || ds.n_images == 0)
             return;
 
         commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
@@ -513,21 +513,21 @@ public:
     }
 
     bool check_next_frame(double play_time) {
-        auto next_idx = (dataIdx + 1) % N_INFLIGHT_SUB;
-        auto& ad = data[next_idx];
+        auto next_idx = (frame_idx + 1) % N_INFLIGHT_SUB;
+        auto& ad = frames[next_idx];
         switch (ad.status) {
-        case DataSet::Upload:
+        case ImageSet::Upload:
             if (ad.play_time <= play_time) {
-                ad.status = DataSet::Ready;
+                ad.status = ImageSet::Ready;
             }
             break;
-        case DataSet::Discard:
+        case ImageSet::Discard:
             if (device.waitForFences(*ad.copyFence, vk::True, 0) == vk::Result::eSuccess) {
-                ad.status = DataSet::New;
+                ad.status = ImageSet::New;
                 return true;
             }
             return false;
-        case DataSet::Ready:
+        case ImageSet::Ready:
             break;
         default:
             return true;
