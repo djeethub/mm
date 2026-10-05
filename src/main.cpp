@@ -220,6 +220,11 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
                         auto out_fmt = state->gpu.get_pix_fmt();
                         auto out_desc = out_fmt != AV_PIX_FMT_NONE ? av_get_pix_fmt_name(out_fmt) : "n/a";
                         auto video_desc = std::format("Video: {} -> {} -> {}", av_get_pix_fmt_name(video_ctx->pix_fmt), video_ctx->codec->name, out_desc);
+                        if (state->media_mode == Video) {
+                            auto fps = state->video.get_fps();
+                            auto rate = (double) state->frames_actual / state->frames_total;
+                            video_desc += std::format(" {:.0f}/{:.0f}fps", fps * rate, fps);
+                        }
                         gui.show_noti(video_desc);
                     }
                 }

@@ -50,7 +50,6 @@ private:
     static inline const std::flat_set<std::string> image_exts = { ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".jfif" };
     static inline const std::flat_set<std::string> sound_exts = { ".mp3", ".flac", ".opus", ".wav", ".ogg", ".ape", ".tta", ".mpa", ".wma", ".aac" };
     std::future<DirData *> dir_future;
-    double seek_time;
     AVSubtitleType sub_type;
     SDL_AudioSpec audio_spec;
 
@@ -68,6 +67,9 @@ public:
     bool is_loop = true;
     MediaMode media_mode;
     ff::time_point action_tp;
+    double seek_time;
+    int frames_actual;
+    int frames_total;
     
     ~AppState() {
         gpu.shutdown();
@@ -337,6 +339,7 @@ public:
         video.cv.notify_one();
         video.start_thread();
         set_video_play(true);
+        frames_total = frames_actual = 0;
         return true;
     }
 
@@ -470,6 +473,7 @@ public:
                 video.set_play_time(play_time);
             }
             if (!data.frame || pp->play_time <= play_time) {
+                frames_total++;
                 data = std::move(*pp);
                 video.video_frame_queue.pop();
             } else {
@@ -750,6 +754,7 @@ public:
             while (gpu.check_next_frame(play_time)) {
                 ff::AvFrameData data = fetch_video_frame(play_time);
                 if (data.frame) {
+                    frames_actual++;
                     gpu.set_frame(std::move(data));
                 } else {
                     if (video.is_eof.load(std::memory_order_relaxed)) {

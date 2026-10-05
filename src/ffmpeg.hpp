@@ -518,9 +518,10 @@ public:
                     av_buffer_unref(&hw_device_ctx);
             }
 #endif
+        } else {
+            video_codec_ctx->thread_count = 0;
+            video_codec_ctx->thread_type = FF_THREAD_FRAME; // Or FF_THREAD_SLICE
         }
-        video_codec_ctx->thread_count = 0;
-        video_codec_ctx->thread_type = FF_THREAD_FRAME; // Or FF_THREAD_SLICE
         avcodec_parameters_to_context(video_codec_ctx, codec_params);
         auto err = avcodec_open2(video_codec_ctx, codec, nullptr);
         if (err) {
@@ -880,6 +881,21 @@ public:
             thread.join();
     }
 
+    double get_fps() {
+        auto fps = av_q2d(video_codec_ctx->framerate);
+        if (fps == 0) {
+            auto stream = format_ctx->streams[video_stream_index];
+            fps = av_q2d(stream->avg_frame_rate);
+            if (fps == 0) {
+                fps = av_q2d(stream->r_frame_rate);
+                if (fps == 0) {
+                    fps = 1.0 / av_q2d(video_codec_ctx->time_base);
+                }
+            }
+        }
+        return fps;
+    }
+
 private:
     AVFormatContext* format_ctx = nullptr;
     AVCodecContext* audio_codec_ctx = nullptr;
@@ -955,6 +971,14 @@ private:
             } else {
             }
     #endif
+/*    
+            // handle vp9 memory corruption
+            ID3D10Multithread* pMultithread = nullptr;
+            if (SUCCEEDED(d3d11_device->QueryInterface(IID_PPV_ARGS(&pMultithread)))) {
+                pMultithread->SetMultithreadProtected(TRUE);
+                pMultithread->Release();
+            }
+*/
             ID3D11DeviceContext4 *context4 = nullptr;
             d3d11_context->QueryInterface(IID_PPV_ARGS(&context4));
 
