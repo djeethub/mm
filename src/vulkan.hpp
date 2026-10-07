@@ -31,7 +31,7 @@ void check_vk_result(VkResult err)
 
 static VKAPI_ATTR vk::Bool32 VKAPI_CALL debugCallback(vk::DebugUtilsMessageSeverityFlagBitsEXT severity, vk::DebugUtilsMessageTypeFlagsEXT type, const vk::DebugUtilsMessengerCallbackDataEXT *pCallbackData, void *)
 {
-#ifdef __linux__	
+#ifdef __linux__
     std::println("[Vulkan {}] {}", to_string(type), pCallbackData->pMessage);
 #else
 	SDL_Log("[Vulkan %s] %s\n", to_string(type).c_str(), pCallbackData->pMessage);
@@ -381,7 +381,7 @@ private:
 		swapChain       = vk::raii::SwapchainKHR(device, swapChainCreateInfo);
 		swapChainImages = swapChain.getImages();
 	}
-    
+
 	vk::raii::ImageView createImageView(vk::Image const &image, vk::Format format)
 	{
 		vk::ImageViewCreateInfo viewInfo{
@@ -415,7 +415,7 @@ private:
 		createCommandPool();
 		createCommandBuffers();
         createSyncObjects();
-		
+
         memProperties = physicalDevice.getMemoryProperties();
     }
 
@@ -463,7 +463,7 @@ public:
 		this->window = window;
         SDL_GetWindowSizeInPixels(window, &wnd_w, &wnd_h);
         SetupVulkan(window);
-		
+
 		video.init_once(device);
 
         return true;

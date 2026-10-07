@@ -15,7 +15,7 @@
 #include "ass.hpp"
 #include "vulkan.hpp"
 #include "gui.hpp"
-//#include "sub_bitmap.hpp"
+#include "sub_bitmap.hpp"
 #include "readerwriterqueue.h"
 
 constexpr auto LARGE_INTERVAL = 777777.7;
@@ -70,7 +70,8 @@ public:
     double seek_time;
     int frames_actual;
     int frames_total;
-    
+    double elapsed;
+
     ~AppState() {
         gpu.shutdown();
         if (window)
@@ -192,7 +193,7 @@ public:
         } catch (...) {
             // filesystem errors -> failure
         }
-        
+
         return data;
     }
 
@@ -301,7 +302,7 @@ public:
                             sdl_fmt = SDL_AUDIO_UNKNOWN;
                     }
                     audio_spec = { sdl_fmt, audio_ctx->ch_layout.nb_channels, audio_ctx->sample_rate };
-                    
+
                     audio_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &audio_spec, nullptr, nullptr);
                     if (!audio_stream) {
                         SDL_Log("Failed to create audio stream: %s", SDL_GetError());
@@ -327,7 +328,7 @@ public:
 
             resize_window();
 //            SDL_SetWindowTitle(window, file_path.c_str());
-            
+
             seek_time = video.get_start_time();
             video.seek_time = seek_time;
             is_seeking = true;
@@ -340,6 +341,7 @@ public:
         video.start_thread();
         set_video_play(true);
         frames_total = frames_actual = 0;
+        elapsed = 0.0;
         return true;
     }
 
@@ -380,13 +382,15 @@ public:
             {
                 if (reset)
                     clear_frame_buffers();
+                auto now = std::chrono::steady_clock::now();
+                elapsed += get_play_time(now) - ts;
                 seek_time = ts;
                 video.seek_time = ts;
                 video.is_seeking = true;
                 is_seeking = true;
                 video.status = ff::Reset;
 //                video.read_next_frame(ts);
-                video.set_play_time(ts);
+                video.set_play_time(ts, now);
             } else
                 return false;
         }
@@ -513,7 +517,7 @@ public:
 
             case SUBTITLE_BITMAP:
             {
-/*                SubBitmap *sub;
+                SubBitmap *sub;
                 auto pp = std::get_if<SubBitmap *>(&app_sub);
                 if (pp && *pp) {
                     sub = *pp;
@@ -525,7 +529,7 @@ public:
                     sub = new SubBitmap(gpu.get_device());
                     app_sub = sub;
                 }
-                sub->init(video.get_subtitle_ctx(), window);*/
+                sub->init(video.get_subtitle_ctx(), window);
             }
                 break;
 
@@ -538,7 +542,7 @@ public:
         while (auto pp = video.sub_queue.peek()) {
             auto sub = *pp;
             if (sub_type == SUBTITLE_BITMAP) {
-//                std::get<SubBitmap *>(app_sub)->add_sub(sub);
+                std::get<SubBitmap *>(app_sub)->add_sub(sub);
                 video.sub_queue.pop();
                 continue;
             }
@@ -553,7 +557,7 @@ public:
                         }
                         break;
                     case SUBTITLE_BITMAP:
-//                        std::get<SubBitmap *>(app_sub)->add_sub(sub);
+                        std::get<SubBitmap *>(app_sub)->add_sub(sub);
                         done = true;
                         break;
                 }
@@ -565,8 +569,12 @@ public:
         }
     }
 
+    double get_play_time(ff::time_point now) const {
+        return video.is_paused ? seek_time : video.get_play_time(now);
+    }
+
     double get_play_time() const {
-        return video.is_paused ? seek_time : video.get_play_time();
+        return get_play_time(std::chrono::steady_clock::now());
     }
 
     void resize_window(float window_scale = 1.0) {

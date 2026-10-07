@@ -5,14 +5,6 @@
 #define N_INFLIGHT_SUB 3
 #define N_MAX_SUBS 999
 
-struct Vertex {
-    float x, y;
-    float w, h;
-    float r, g, b, a;
-    float u, v; // Bottom-Right UV
-    float u1, v1; // padding
-};
-
 struct ImageData {
     vk::raii::Image image = nullptr;
     vk::raii::DeviceMemory memory = nullptr;
@@ -25,7 +17,7 @@ struct ImageData {
     uint32_t alloc_w = 0;
     uint32_t alloc_h = 0;
 
-    void init(const vk::raii::Device& device, uint32_t w, uint32_t h) {
+    void init(const vk::raii::Device& device, uint32_t w, uint32_t h, vk::Format fmt) {
         this->w = w;
         this->h = h;
         if (alloc_w >= w && alloc_h >= h)
@@ -35,7 +27,7 @@ struct ImageData {
 
         vk::ImageCreateInfo info = {
             .imageType = vk::ImageType::e2D,
-            .format = vk::Format::eR8Unorm,
+            .format = fmt,
             .extent = { .width = (uint32_t) alloc_w, .height = (uint32_t) alloc_h, .depth = 1 },
             .mipLevels = 1,
             .arrayLayers = 1,
@@ -64,9 +56,18 @@ struct ImageData {
             }
         };
         imageView = device.createImageView(viewInfo);
-        
+
+        int bpp;
+        switch (fmt) {
+            case vk::Format::eR8Unorm:
+                bpp = 1;
+                break;
+            default:
+                bpp = 4;
+        }
+
         vk::BufferCreateInfo buffer_info = {
-            .size = alloc_w * alloc_h,
+            .size = alloc_w * alloc_h * bpp,
             .usage = vk::BufferUsageFlagBits::eTransferSrc,
             .sharingMode = vk::SharingMode::eExclusive
         };
@@ -81,6 +82,7 @@ struct ImageData {
     }
 };
 
+template <typename VERT>
 struct ImageSet {
     enum Status {
         None,
@@ -92,7 +94,7 @@ struct ImageSet {
 
     std::vector<ImageData> images;
     uint32_t n_images = 0;
-    std::vector<Vertex> vertices;
+    std::vector<VERT> vertices;
 
     vk::raii::Semaphore semaphore = nullptr;
     vk::raii::Buffer buffer = nullptr;
@@ -146,4 +148,4 @@ public:
 
 class SubAss;
 class SubBitmap;
-using AppSub = std::variant<SubAss *>;//, SubBitmap *>;
+using AppSub = std::variant<SubAss *, SubBitmap *>;

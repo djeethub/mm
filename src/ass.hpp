@@ -7,15 +7,24 @@
 #include "ass.vert.h"
 #include "ass.frag.h"
 
+struct alignas(16) Vertex {
+    float x, y;
+    float w, h;
+    float r, g, b, a;
+    float u, v; // Bottom-Right UV
+};
+
+using AssImageSet = ImageSet<Vertex>;
+
 class SubAss : public AppSubtitle {
 private:
-    ImageSet frames[N_INFLIGHT_SUB];
+    AssImageSet frames[N_INFLIGHT_SUB];
     int frame_idx = 0;
 
     ASS_Library *ass_library = nullptr;
     ASS_Renderer *ass_renderer = nullptr;
     ASS_Track *ass_track = nullptr;
-    
+
 	void createGraphicsPipeline(const vk::raii::Device& device, vk::Format swap_format)
 	{
         vk::ShaderModuleCreateInfo shader_info{
@@ -231,8 +240,8 @@ public:
 
         if (subtitle_codec_ctx->subtitle_header_size > 0) {
             ass_process_codec_private(
-                ass_track, 
-                (char*)subtitle_codec_ctx->subtitle_header, 
+                ass_track,
+                (char*)subtitle_codec_ctx->subtitle_header,
                 subtitle_codec_ctx->subtitle_header_size
             );
 
@@ -249,10 +258,10 @@ public:
         // Loop through all tracks/streams in the container
         for (unsigned int i = 0; i < format_ctx->nb_streams; i++) {
             AVStream* stream = format_ctx->streams[i];
-            
+
             // Look specifically for file attachments
             if (stream->codecpar->codec_type == AVMEDIA_TYPE_ATTACHMENT) {
-                
+
                 // Extract the font filename from metadata
                 std::string font_name = "unknown_font";
                 AVDictionaryEntry* tag = av_dict_get(stream->metadata, "filename", nullptr, 0);
@@ -262,32 +271,32 @@ public:
 
                 // Verify that the attachment contains data
                 if (stream->codecpar->extradata && stream->codecpar->extradata_size > 0) {
-                    
+
                     char* font_data = reinterpret_cast<char*>(stream->codecpar->extradata);
                     int font_data_size = stream->codecpar->extradata_size;
 
                     // Register the raw font buffer into libass's internal memory pool
                     ass_add_font(ass_library, font_name.c_str(), font_data, font_data_size);
-                    
-//                    std::cout << "Successfully matched and loaded font: " << font_name 
+
+//                    std::cout << "Successfully matched and loaded font: " << font_name
 //                            << " (" << font_data_size << " bytes)" << std::endl;
                 }
             }
         }
-    }   
+    }
 
     void flush() {
         if (ass_track)
             ass_flush_events(ass_track);
-        
+
         for (auto i = 0; i < N_INFLIGHT_SUB; i++) {
-            frames[i].status = ImageSet::Discard;
+            frames[i].status = AssImageSet::Discard;
         }
     }
 
     void add_ass(const std::string& text, long long pts, long long duration) {
         ass_process_chunk(
-                        ass_track, 
+                        ass_track,
                         text.c_str(),          // The raw time-stripped ASS string payload
                         text.length(),  // String length
                         pts,             // Explicit start time (ms)
@@ -295,7 +304,7 @@ public:
         );
     }
 
-    void upload_data(ImageSet& ds, const vk::raii::Queue& queue) {
+    void upload_data(AssImageSet& ds, const vk::raii::Queue& queue) {
         if (ds.n_images == 0)
             return;
 
@@ -454,7 +463,7 @@ public:
             if (idx >= alloc_images)
                 ds.images.emplace_back();
             ImageData& id = ds.images[idx];
-            id.init(device, img->w, img->h);
+            id.init(device, img->w, img->h, vk::Format::eR8Unorm);
 
             uint8_t *map = (uint8_t *) id.up_memory.mapMemory(0, img->w * img->h);
             const uint8_t* src = img->bitmap;
@@ -462,7 +471,7 @@ public:
                 memcpy(map + (y * img->w), src + (y * img->stride), img->w);
             }
             id.up_memory.unmapMemory();
-            
+
             uint32_t c = img->color;
             float r = ((c >> 24) & 0xFF) / 255.0f;
             float g = ((c >> 16) & 0xFF) / 255.0f;
@@ -480,18 +489,18 @@ public:
         ds.n_images = idx;
 
         upload_data(ds, queue);
-        ds.status = ImageSet::Upload;
+        ds.status = AssImageSet::Upload;
         ds.play_time = play_time;
     }
 
     void draw(const vk::CommandBuffer commandBuffer, std::vector<vk::SemaphoreSubmitInfo>& vector) {
         auto next_idx = (frame_idx + 1) % N_INFLIGHT_SUB;
-        if (frames[next_idx].status == ImageSet::Ready) {
-            frames[frame_idx].status = ImageSet::New;
+        if (frames[next_idx].status == AssImageSet::Ready) {
+            frames[frame_idx].status = AssImageSet::New;
             frame_idx = next_idx;
         }
         auto& ds = frames[frame_idx];
-        if (ds.status != ImageSet::Ready || ds.n_images == 0)
+        if (ds.status != AssImageSet::Ready || ds.n_images == 0)
             return;
 
         commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
@@ -516,18 +525,18 @@ public:
         auto next_idx = (frame_idx + 1) % N_INFLIGHT_SUB;
         auto& ad = frames[next_idx];
         switch (ad.status) {
-        case ImageSet::Upload:
+        case AssImageSet::Upload:
             if (ad.play_time <= play_time) {
-                ad.status = ImageSet::Ready;
+                ad.status = AssImageSet::Ready;
             }
             break;
-        case ImageSet::Discard:
+        case AssImageSet::Discard:
             if (device.waitForFences(*ad.copyFence, vk::True, 0) == vk::Result::eSuccess) {
-                ad.status = ImageSet::New;
+                ad.status = AssImageSet::New;
                 return true;
             }
             return false;
-        case ImageSet::Ready:
+        case AssImageSet::Ready:
             break;
         default:
             return true;

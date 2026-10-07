@@ -1,31 +1,46 @@
 #version 450
 
-layout(std140, set = 1, binding = 0) uniform TransformBlock {
+struct SpriteInstance {
     vec2 position;
     vec2 size;
-    vec2 uv_size;
-} transform;
+    vec2 uv;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer SpriteBuffer {
+    SpriteInstance sprites[];
+};
 
 // Outputs to Fragment Shader
 layout(location = 0) out vec2 outUV;
+layout(location = 1) flat out uint outId;
 
-const vec2 unit_quad[4] = vec2[](
+const vec2 unit_quad[6] = vec2[](
     vec2(-0.5, -0.5), // Bottom-Left
     vec2( 0.5, -0.5), // Bottom-Right
     vec2(-0.5,  0.5), // Top-Left
+
+    vec2(-0.5,  0.5), // Top-Left
+    vec2( 0.5, -0.5), // Bottom-Right
     vec2( 0.5,  0.5)  // Top-Right
 );
 
-const vec2 uvs[4] = vec2[](
+const vec2 uvs[6] = vec2[](
     vec2(0.0, 1.0),
     vec2(1.0, 1.0),
     vec2(0.0, 0.0),
+
+    vec2(0.0, 0.0),
+    vec2(1.0, 1.0),
     vec2(1.0, 0.0)
 );
 
 void main() {
-    vec2 finalPosition = (unit_quad[gl_VertexIndex] * transform.size) + transform.position;
-    
+    uint sprite_id = gl_VertexIndex / 6;
+    uint vertex_id = gl_VertexIndex % 6;
+    SpriteInstance sprite = sprites[sprite_id];
+
+    vec2 finalPosition = (unit_quad[vertex_id] * sprite.size) + sprite.position;
     gl_Position = vec4(finalPosition, 0.0, 1.0);
-    outUV = uvs[gl_VertexIndex] * transform.uv_size;
+    outId = sprite_id;
+    outUV = uvs[vertex_id] * sprite.uv;
 }

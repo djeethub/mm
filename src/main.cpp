@@ -107,7 +107,7 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
                     break;
                 case SDLK_BACKSPACE:
                     if (state->open_next_file(Prev)) {
-                        gui.show_noti(state->get_file_name());                        
+                        gui.show_noti(state->get_file_name());
                     }
                     break;
                 case SDLK_L:
@@ -221,9 +221,11 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
                         auto out_desc = out_fmt != AV_PIX_FMT_NONE ? av_get_pix_fmt_name(out_fmt) : "n/a";
                         auto video_desc = std::format("Video: {} -> {} -> {}", av_get_pix_fmt_name(video_ctx->pix_fmt), video_ctx->codec->name, out_desc);
                         if (state->media_mode == Video) {
-                            auto fps = state->video.get_fps();
-                            auto rate = (double) state->frames_actual / state->frames_total;
-                            video_desc += std::format(" {:.0f}/{:.0f}fps", fps * rate, fps);
+                            auto elapsed = state->get_play_time() + state->elapsed;
+                            if (elapsed > 0) {
+                                auto fps = (double) state->frames_actual / elapsed;
+                                video_desc += std::format(" {:.1f}fps", fps);
+                            }
                         }
                         gui.show_noti(video_desc);
                     }

@@ -6,182 +6,197 @@
 #include "bitmap.vert.h"
 #include "bitmap.frag.h"
 
-struct alignas(16) BitmapForm {
+struct alignas(8) BmpForm {
     float position[2]; // x, y (in NDC: -1.0 to 1.0)
     float size[2];     // width, height (in NDC: 0.0 to 2.0)
     float uv_size[2];
 };
 
-struct BitmapData {
-    SDL_GPUTexture *tex;
-    SDL_GPUTexture *tex_pal;
-    Uint32 w;
-    Uint32 h;
-    SDL_GPUTransferBuffer *buf;
-
-    BitmapForm form;
-
-    void reset() {
-    }
-
-    void destroy(SDL_GPUDevice* gpu) {
-        if (tex)
-            SDL_ReleaseGPUTexture(gpu, tex);
-        if (tex_pal)
-            SDL_ReleaseGPUTexture(gpu, tex_pal);
-        if (buf)
-            SDL_ReleaseGPUTransferBuffer(gpu, buf);
-        delete this;
-    }    
-};
-
-class BitmapPool : public GPUPool<BitmapData> {
-public:
-    BitmapData *alloc(Uint32 w, Uint32 h) {
-        while (!list.empty()) {
-            auto data = list.back();
-            list.pop_back();
-            if (data->w >= w && data->h >= h)
-                return data;
-            data->destroy(device);
-        }
-
-        w += 64;
-        h += 32;
-
-        SDL_GPUTextureCreateInfo tex_info = {
-            .type = SDL_GPU_TEXTURETYPE_2D,
-            .format = SDL_GPU_TEXTUREFORMAT_R8_UNORM,
-            .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER,
-            .width = w,
-            .height = h,
-            .layer_count_or_depth = 1,
-            .num_levels = 1
-        };
-        auto tex = SDL_CreateGPUTexture(device, &tex_info);
-        if (!tex)
-            return nullptr;
-
-        tex_info = {
-            .type = SDL_GPU_TEXTURETYPE_2D,
-            .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
-            .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER,
-            .width = 256,
-            .height = 1,
-            .layer_count_or_depth = 1,
-            .num_levels = 1
-        };
-        auto tex_pal = SDL_CreateGPUTexture(device, &tex_info);
-        if (!tex_pal) {
-            SDL_ReleaseGPUTexture(device, tex);
-            return nullptr;
-        }
-
-        SDL_GPUTransferBufferCreateInfo tb_info = {
-			.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
-			.size = w * h + 256 * 4,
-		};
-		auto buf = SDL_CreateGPUTransferBuffer(device, &tb_info);
-        if (!buf) {
-            SDL_ReleaseGPUTexture(device, tex);
-            SDL_ReleaseGPUTexture(device, tex_pal);
-            return nullptr;
-        }
- 
-        return new BitmapData {
-            .tex = tex,
-            .tex_pal = tex_pal,
-            .w = w,
-            .h = h,
-            .buf = buf,
-        };
-    }
-};
+using BmpImageSet = ImageSet<BmpForm>;
 
 class SubBitmap : public AppSubtitle {
 private:
-    BitmapPool tex_pool;
+    BmpImageSet frames[N_INFLIGHT_SUB];
+    int frame_idx = 0;
+
     std::list<ff::AVSubtitle_ *> sub_list;
     int canvas_w;
     int canvas_h;
+    ff::AVSubtitle_ *prev = nullptr;
 
-    bool init_pipeline(SDL_Window *window) {
-        if (pipeline)
-            return true;
-
-		SDL_GPUShaderCreateInfo shader_info = {
-            .code_size = bitmap_vert_len,
-            .code = bitmap_vert,
-			.entrypoint = "main",
-			.format = SDL_GPU_SHADERFORMAT_SPIRV,
-            .stage = SDL_GPU_SHADERSTAGE_VERTEX,
-            .num_uniform_buffers = 1,
-		};
-        SDL_GPUShader *vert_shader = SDL_CreateGPUShader(device, &shader_info);
-        shader_info.code_size = bitmap_frag_len,
-        shader_info.code = bitmap_frag;
-        shader_info.stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
-		shader_info.num_samplers = 2;
-    	shader_info.num_uniform_buffers = 0;
-        SDL_GPUShader *frag_shader = SDL_CreateGPUShader(device, &shader_info);
-
-        auto color_desc = SDL_GPUColorTargetDescription{
-            .format = SDL_GetGPUSwapchainTextureFormat(device, window),
-            .blend_state = {
-                .src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA,
-                .dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
-                .color_blend_op = SDL_GPU_BLENDOP_ADD,
-                .src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE,
-                .dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
-                .alpha_blend_op = SDL_GPU_BLENDOP_ADD,
-                .enable_blend = true,
-            }
+	void createGraphicsPipeline(const vk::raii::Device& device, vk::Format swap_format)
+	{
+        vk::ShaderModuleCreateInfo shader_info{
+            .codeSize = bitmap_vert_len,
+            .pCode = (uint32_t *) bitmap_vert,
         };
-        SDL_GPUGraphicsPipelineCreateInfo pipeline_info = {
-            .vertex_shader = vert_shader,
-            .fragment_shader = frag_shader,
-            .primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLESTRIP,
-            .target_info = {
-                .color_target_descriptions = &color_desc,
-                .num_color_targets = 1,
+        auto vert_shader = device.createShaderModule(shader_info);
+        shader_info = vk::ShaderModuleCreateInfo{
+            .codeSize = bitmap_frag_len,
+            .pCode = (uint32_t *) bitmap_frag,
+        };
+        auto frag_shader = device.createShaderModule(shader_info);
+
+		vk::PipelineShaderStageCreateInfo vertShaderStageInfo{.stage = vk::ShaderStageFlagBits::eVertex, .module = vert_shader, .pName = "main"};
+		vk::PipelineShaderStageCreateInfo fragShaderStageInfo{.stage = vk::ShaderStageFlagBits::eFragment, .module = frag_shader, .pName = "main"};
+		vk::PipelineShaderStageCreateInfo shaderStages[] = {vertShaderStageInfo, fragShaderStageInfo};
+
+		vk::PipelineVertexInputStateCreateInfo   vertexInputInfo{.vertexBindingDescriptionCount   = 0,
+		                                                         .pVertexBindingDescriptions      = nullptr,
+		                                                         .vertexAttributeDescriptionCount = 0,
+		                                                         .pVertexAttributeDescriptions    = nullptr};
+		vk::PipelineInputAssemblyStateCreateInfo inputAssembly{.topology = vk::PrimitiveTopology::eTriangleList};
+
+		vk::PipelineViewportStateCreateInfo      viewportState{.viewportCount = 1, .scissorCount = 1};
+
+		vk::PipelineRasterizationStateCreateInfo rasterizer{.depthClampEnable        = vk::False,
+		                                                    .rasterizerDiscardEnable = vk::False,
+		                                                    .polygonMode             = vk::PolygonMode::eFill,
+		                                                    .cullMode                = vk::CullModeFlagBits::eNone,
+		                                                    .frontFace               = vk::FrontFace::eCounterClockwise,
+		                                                    .depthBiasEnable         = vk::False,
+		                                                    .lineWidth               = 1.0f};
+
+		vk::PipelineMultisampleStateCreateInfo multisampling{.rasterizationSamples = vk::SampleCountFlagBits::e1, .sampleShadingEnable = vk::False};
+
+		vk::PipelineColorBlendAttachmentState colorBlendAttachment{
+		    .blendEnable    = vk::True,
+            .srcColorBlendFactor = vk::BlendFactor::eSrcAlpha,
+            .dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha,
+            .colorBlendOp = vk::BlendOp::eAdd,
+            .srcAlphaBlendFactor = vk::BlendFactor::eOne,
+            .dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha,
+            .alphaBlendOp = vk::BlendOp::eAdd,
+		    .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG | vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA};
+
+		vk::PipelineColorBlendStateCreateInfo colorBlending{
+		    .logicOpEnable = vk::False, .logicOp = vk::LogicOp::eCopy, .attachmentCount = 1, .pAttachments = &colorBlendAttachment};
+
+		std::vector<vk::DynamicState>      dynamicStates = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+		vk::PipelineDynamicStateCreateInfo dynamicState{.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size()), .pDynamicStates = dynamicStates.data()};
+
+		vk::PipelineLayoutCreateInfo pipelineLayoutInfo{.setLayoutCount = 1, .pSetLayouts = &*layout};
+		pipelineLayout = vk::raii::PipelineLayout(device, pipelineLayoutInfo);
+
+		vk::StructureChain<vk::GraphicsPipelineCreateInfo, vk::PipelineRenderingCreateInfo> pipelineCreateInfoChain = {
+		    {
+                .stageCount          = 2,
+                .pStages             = shaderStages,
+   		        .pVertexInputState   = &vertexInputInfo,
+                .pInputAssemblyState = &inputAssembly,
+                .pViewportState      = &viewportState,
+                .pRasterizationState = &rasterizer,
+                .pMultisampleState   = &multisampling,
+                .pColorBlendState    = &colorBlending,
+                .pDynamicState       = &dynamicState,
+                .layout              = pipelineLayout,
             },
+		    {.colorAttachmentCount = 1, .pColorAttachmentFormats = &swap_format}
         };
 
-        pipeline = SDL_CreateGPUGraphicsPipeline(device, &pipeline_info);
-        SDL_ReleaseGPUShader(device, vert_shader);
-		SDL_ReleaseGPUShader(device, frag_shader);
-        return pipeline != nullptr;
-    }
+		pipeline = vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
+	}
 
 public:
-    SubBitmap(SDL_GPUDevice *gpu) : AppSubtitle(gpu) {
-        init_once(gpu);
+    SubBitmap(const vk::raii::Device& gpu) : AppSubtitle(gpu) {
+        init_once();
     }
     ~SubBitmap() {
         shutdown();
     }
 
     void shutdown() {
-        SDL_ReleaseGPUGraphicsPipeline(device, pipeline);
-        pipeline = nullptr;
-        SDL_ReleaseGPUSampler(device, sampler);
-        sampler = nullptr;
-        tex_pool.clear();
         flush();
     }
 
-    void init_once(SDL_GPUDevice *gpu) {
-        device = gpu;
-        tex_pool.init(device);
+    void init_once() {
+        vk::SamplerCreateInfo info = {
+            .magFilter = vk::Filter::eLinear,
+            .minFilter = vk::Filter::eLinear,
+            .mipmapMode = vk::SamplerMipmapMode::eLinear,
+            .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+            .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+            .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+        };
+        sampler = device.createSampler(info);
 
-		SDL_GPUSamplerCreateInfo samp_info = {
-			.min_filter = SDL_GPU_FILTER_NEAREST,
-			.mag_filter = SDL_GPU_FILTER_NEAREST,
-			.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
-			.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
-			.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
-		};
-		sampler = SDL_CreateGPUSampler(device, &samp_info);
+        // Define the Descriptor Set Layout with an Immutable Sampler
+        vk::DescriptorSetLayoutBinding bindings[] = {
+            {
+                .binding = 0,
+                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                .descriptorCount = N_MAX_SUBS,
+                .stageFlags = vk::ShaderStageFlagBits::eFragment,
+            },
+            {
+                .binding = 1,
+                .descriptorType = vk::DescriptorType::eStorageBuffer,
+                .descriptorCount = 1,
+                .stageFlags = vk::ShaderStageFlagBits::eVertex,
+            },
+        };
+        vk::DescriptorSetLayoutCreateInfo layoutInfo{
+            .bindingCount = std::size(bindings),
+            .pBindings = bindings,
+        };
+        layout = device.createDescriptorSetLayout(layoutInfo);
+
+        vk::DescriptorPoolSize pool_sizes[] =
+        {
+            { vk::DescriptorType::eCombinedImageSampler, N_INFLIGHT_SUB * N_MAX_SUBS },
+            { vk::DescriptorType::eStorageBuffer, N_INFLIGHT_SUB },
+        };
+        vk::DescriptorPoolCreateInfo pool_info{
+//            .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+            .maxSets = N_INFLIGHT_SUB,
+            .poolSizeCount = std::size(pool_sizes),
+            .pPoolSizes = pool_sizes
+        };
+        pool = device.createDescriptorPool(pool_info);
+
+        std::vector<vk::DescriptorSetLayout> layouts(N_INFLIGHT_SUB, layout);
+        vk::DescriptorSetAllocateInfo alloc_info{
+            .descriptorPool = pool,
+            .descriptorSetCount = N_INFLIGHT_SUB,
+            .pSetLayouts = layouts.data()
+        };
+        auto sets = (*device).allocateDescriptorSets(alloc_info);
+
+        vk::CommandPoolCreateInfo poolInfo = {
+            .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer | vk::CommandPoolCreateFlagBits::eTransient,
+            .queueFamilyIndex = queueIndex
+        };
+        commandPool = device.createCommandPool(poolInfo);
+
+        vk::CommandBufferAllocateInfo allocInfo = {
+            .commandPool = commandPool,
+            .level = vk::CommandBufferLevel::ePrimary,
+            .commandBufferCount = N_INFLIGHT_SUB
+        };
+        auto commandBuffers = (*device).allocateCommandBuffers(allocInfo);
+
+        vk::FenceCreateInfo fence_info = {
+            .flags = vk::FenceCreateFlagBits::eSignaled,
+        };
+
+        vk::SemaphoreTypeCreateInfo timelineInfo{
+            .semaphoreType = vk::SemaphoreType::eTimeline,
+            .initialValue = 0,
+        };
+        vk::SemaphoreCreateInfo semaphoreInfo{
+            .pNext = &timelineInfo
+        };
+
+        for (auto i = 0; i < N_INFLIGHT_SUB; i++) {
+            frames[i] = {
+                .semaphore = device.createSemaphore(semaphoreInfo),
+                .copyFence = device.createFence(fence_info),
+                .set = sets[i],
+                .commandBuffer = commandBuffers[i],
+            };
+        }
+
+        createGraphicsPipeline(device, swapChainSurfaceFormat.format);
     }
 
     bool init(AVCodecContext *sub_codec_ctx, SDL_Window *window) {
@@ -209,9 +224,11 @@ public:
                 canvas_w = 1920;
                 canvas_h = 1080;
             }
-        }        
+        }
 
-        return init_pipeline(window);
+        commandPool.reset();
+
+        return true;
     }
 
     void flush() {
@@ -219,14 +236,148 @@ public:
             ff::subtitle_recycle(sub);
         }
         sub_list.clear();
+        prev = nullptr;
+
+        for (auto i = 0; i < N_INFLIGHT_SUB; i++) {
+            frames[i].status = BmpImageSet::Discard;
+        }
     }
 
     void add_sub(ff::AVSubtitle_ *sub) {
         sub_list.push_back(sub);
     }
 
-    void prepare_draw(SDL_GPUCopyPass *pass, double play_time) {
-        tex_pool.recycle();
+    void upload_data(BmpImageSet& ds, const vk::raii::Queue& queue) {
+        if (ds.n_images == 0)
+            return;
+
+        auto size = ds.vertices.size() * sizeof(BmpForm);
+        ds.alloc_buf(device, size);
+        uint8_t *map = (uint8_t *) ds.memory.mapMemory(0, size);
+        uint8_t *src = (uint8_t *) ds.vertices.data();
+        memcpy(map, src, size);
+        ds.memory.unmapMemory();
+
+        auto textureCount = ds.n_images;
+        std::vector<vk::DescriptorImageInfo> imageInfos(textureCount);
+        std::vector<vk::WriteDescriptorSet> descriptorWrites(textureCount + 1);
+
+        device.resetFences(*ds.copyFence);
+        vk::CommandBufferBeginInfo begin_info{
+            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit
+        };
+        ds.commandBuffer.begin(begin_info);
+
+        uint32_t i = 0;
+        for (; i < textureCount; i++) {
+            auto& id = ds.images[i];
+//            SDL_Log("idx %i atlas %i vertices %i\n", dataIdx, ad.atlas_pool.in_use_list.size(), atlas->vertices.size());
+            vk::ImageMemoryBarrier2 imageBarrier = {
+                .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader | vk::PipelineStageFlagBits2::eHost,
+                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+//                .oldLayout = atlas->newly_created ? vk::ImageLayout::eUndefined : vk::ImageLayout::eShaderReadOnlyOptimal,
+                .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
+                .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
+                .image = *id.image,
+                .subresourceRange = {
+                    .aspectMask = vk::ImageAspectFlags::BitsType::eColor,
+                    .levelCount = 1,
+                    .layerCount = 1,
+                },
+            };
+            vk::DependencyInfo dep_info{
+                .imageMemoryBarrierCount = 1,
+                .pImageMemoryBarriers = &imageBarrier,
+            };
+            ds.commandBuffer.pipelineBarrier2(dep_info);
+
+            vk::BufferImageCopy2 region{
+                .imageSubresource = {
+                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+                    .layerCount = 1,
+                },
+                .imageExtent = {id.w, id.h, 1},
+            };
+            vk::CopyBufferToImageInfo2 copy_info = {
+                .srcBuffer = id.up_buffer,
+                .dstImage = id.image,
+                .dstImageLayout = vk::ImageLayout::eTransferDstOptimal,
+                .regionCount = 1,
+                .pRegions = &region,
+            };
+            ds.commandBuffer.copyBufferToImage2(copy_info);
+
+            imageBarrier = {
+                .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
+                .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
+                .image = *id.image,
+                .subresourceRange = {
+                    .aspectMask = vk::ImageAspectFlags::BitsType::eColor,
+                    .levelCount = 1,
+                    .layerCount = 1,
+                },
+            };
+            dep_info = {
+                .imageMemoryBarrierCount = 1,
+                .pImageMemoryBarriers = &imageBarrier,
+            };
+            ds.commandBuffer.pipelineBarrier2(dep_info);
+
+            // Define the image view and sampler for this array slot
+            imageInfos[i] = {
+                .sampler     = sampler,
+                .imageView   = id.imageView,
+                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            };
+            descriptorWrites[i] = {
+                .dstSet          = ds.set,
+                .dstArrayElement = i,
+                .descriptorCount = 1,
+                .descriptorType  = vk::DescriptorType::eCombinedImageSampler,
+                .pImageInfo      = &imageInfos[i],
+            };
+        }
+
+        ds.commandBuffer.end();
+        vk::CommandBufferSubmitInfo cmd_info{
+            .commandBuffer = ds.commandBuffer,
+        };
+        vk::SemaphoreSubmitInfo signal_info{
+            .semaphore = ds.semaphore,
+            .value = ++ds.counter
+        };
+        vk::SubmitInfo2 submit_info{
+            .commandBufferInfoCount = 1,
+            .pCommandBufferInfos = &cmd_info,
+            .signalSemaphoreInfoCount = 1,
+            .pSignalSemaphoreInfos = &signal_info
+        };
+        queue.submit2(submit_info, ds.copyFence);
+
+        vk::DescriptorBufferInfo bufInfo{
+            .buffer = *ds.buffer,
+            .range = (vk::DeviceSize)size
+        };
+        descriptorWrites[i] = {
+            .dstSet = ds.set,
+            .dstBinding = 1,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &bufInfo,
+        };
+        device.updateDescriptorSets(descriptorWrites, nullptr);
+    }
+
+    ff::AVSubtitle_ *get_next_subtitle(double play_time, bool& changed) {
+        ff::AVSubtitle_ *sub = nullptr;
 
         for (auto it = sub_list.begin(); it != sub_list.end(); ) {
             if ((*it)->frame_time > play_time)
@@ -238,13 +389,35 @@ public:
                 ff::subtitle_recycle((*it));
                 it = sub_list.erase(it);
             }
-            auto sub = (*it);
+            sub = (*it);
             if (sub->frame_time + sub->duration < play_time) {
                 ff::subtitle_recycle(sub);
                 it = sub_list.erase(it);
-                break;
+                sub = nullptr;
             }
+            break;
+        }
+        changed = prev != sub;
+        prev = sub;
+        return sub;
+    }
 
+    void prepare_draw(const vk::raii::Queue& queue, double play_time) {
+        auto next_idx = (frame_idx + 1) % N_INFLIGHT_SUB;
+        auto& ds = frames[next_idx];
+        auto err = device.waitForFences(*ds.copyFence, vk::True, 0);
+        if (err != vk::Result::eSuccess)
+            return;
+
+        bool changed = false;
+        auto sub = get_next_subtitle(play_time, changed);
+        if (!changed)
+            return;
+
+        int idx = 0;
+        if (sub) {
+            ds.vertices.clear();
+            int alloc_images = ds.images.size();
             for (auto i = 0; i < sub->num_rects; i++) {
                 auto rect = sub->rects[i];
                 if (rect->type != SUBTITLE_BITMAP)
@@ -252,62 +425,93 @@ public:
                 if (rect->w == 0 || rect->h == 0)
                     continue;
 
-                auto tex = tex_pool.alloc(rect->w, rect->h);
-                uint8_t* dst = (uint8_t*)SDL_MapGPUTransferBuffer(device, tex->buf, false);
-                Uint32 pal_offset = rect->nb_colors * 4;
-                SDL_memcpy(dst, rect->data[1], pal_offset);
-                dst += pal_offset;
+                if (idx >= alloc_images)
+                    ds.images.emplace_back();
+                ImageData& id = ds.images[idx];
+                id.init(device, rect->w, rect->h, vk::Format::eB8G8R8A8Unorm);
 
-                const uint8_t* src = rect->data[0];
-                for (int y = 0; y < rect->h; ++y) {
-                    SDL_memcpy(dst + (y * rect->w), src + (y * rect->linesize[0]), rect->w);
+                const auto w   = rect->w;
+                const auto h   = rect->h;
+                const auto src_stride = rect->linesize[0];
+                uint8_t *src = rect->data[0];
+                uint32_t *pal = (uint32_t *) rect->data[1];
+                uint32_t *map = (uint32_t *) id.up_memory.mapMemory(0, w * h * 4);
+                if (src_stride == w) {
+                    const auto n = w * h;
+                    for (auto x = 0; x < n; ++x)
+                        *map++ = pal[*src++];
+                } else {
+                    for (auto y = 0; y < h; y++) {
+                        for (auto x = 0; x < w; x++) {
+                            *map++ = pal[*src++];
+                        }
+                        src += src_stride - w;
+                    }
                 }
-                SDL_UnmapGPUTransferBuffer(device, tex->buf);
+                id.up_memory.unmapMemory();
 
-                SDL_GPUTextureTransferInfo transfer_info = {
-                    .transfer_buffer = tex->buf,
-                    .offset = pal_offset,
-                };
-                SDL_GPUTextureRegion region = {
-                    .texture = tex->tex,
-                    .w = (Uint32) rect->w,
-                    .h = (Uint32) rect->h,
-                    .d = 1
-                };
-                SDL_UploadToGPUTexture(pass, &transfer_info, &region, false);
-                transfer_info.transfer_buffer = tex->buf;
-                transfer_info.offset = 0;
-                region.texture = tex->tex_pal;
-                region.w = rect->nb_colors;
-                region.h = 1;
-                SDL_UploadToGPUTexture(pass, &transfer_info, &region, false);
-
-                tex->form = {
-                    2.0f * (rect->x + rect->w / 2.0f) / canvas_w - 1.0f, 1.0f - 2.0f * (rect->y + rect->h / 2.0f) / canvas_h,
-                    2.0f * rect->w / wnd_w, 2.0f * rect->h / wnd_h,
-                    (float) rect->w / tex->w, (float) rect->h / tex->h
-                };
-                tex_pool.in_use(tex);
+                ds.vertices.push_back({
+                    2.0f * (rect->x + w / 2.0f) / canvas_w - 1.0f, 1.0f - 2.0f * (rect->y + h / 2.0f) / canvas_h,
+                    2.0f * w / wnd_w, 2.0f * h / wnd_h,
+                    (float) w / id.alloc_w, (float) h / id.alloc_h
+                });
+                idx++;
             }
-            break;
         }
+        ds.n_images = idx;
+
+        upload_data(ds, queue);
+        ds.status = BmpImageSet::Upload;
+        ds.play_time = play_time;
     }
 
-    void draw(SDL_GPUCommandBuffer *cmd, SDL_GPURenderPass *pass) {
-        auto list = tex_pool.get_in_use();
-        if (list.empty())
+    void draw(const vk::CommandBuffer commandBuffer, std::vector<vk::SemaphoreSubmitInfo>& wait_info) {
+        auto next_idx = (frame_idx + 1) % N_INFLIGHT_SUB;
+        if (frames[next_idx].status == BmpImageSet::Ready) {
+            frames[frame_idx].status = BmpImageSet::New;
+            frame_idx = next_idx;
+        }
+        auto& ds = frames[frame_idx];
+        if (ds.status != BmpImageSet::Ready || ds.n_images == 0)
             return;
 
-        SDL_BindGPUGraphicsPipeline(pass, pipeline);   // the one with blending enabled            
+        commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+        commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0, ds.set, nullptr);
+        commandBuffer.draw(ds.vertices.size() * 6, 1, 0, 0);
 
-        for (auto data : list) {
-            SDL_PushGPUVertexUniformData(cmd, 0, &data->form, sizeof(data->form));
-            SDL_GPUTextureSamplerBinding t_binding[2] = {
-                { data->tex, sampler },
-                { data->tex_pal, sampler },
-            };
-            SDL_BindGPUFragmentSamplers(pass, 0, t_binding, 2);
-            SDL_DrawGPUPrimitives(pass, 4, 1, 0, 0);
+        wait_info.push_back({
+            .semaphore = ds.semaphore,
+            .value = ds.counter,
+            .stageMask = vk::PipelineStageFlagBits2::eFragmentShader
+        });
+    }
+
+    void window_size_changed(Sint32 w, Sint32 h) {
+        wnd_w = w;
+        wnd_h = h;
+    }
+
+    bool check_next_frame(double play_time) {
+        auto next_idx = (frame_idx + 1) % N_INFLIGHT_SUB;
+        auto& ad = frames[next_idx];
+        switch (ad.status) {
+        case BmpImageSet::Upload:
+            if (ad.play_time <= play_time) {
+                ad.status = BmpImageSet::Ready;
+            }
+            break;
+        case BmpImageSet::Discard:
+            if (device.waitForFences(*ad.copyFence, vk::True, 0) == vk::Result::eSuccess) {
+                ad.status = BmpImageSet::New;
+                return true;
+            }
+            return false;
+        case BmpImageSet::Ready:
+            break;
+        default:
+            return true;
         }
+
+        return false;
     }
 };

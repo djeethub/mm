@@ -1,12 +1,12 @@
 #version 450
+#extension GL_EXT_nonuniform_qualifier : enable
 
-// Texture bindings
-layout(set = 2, binding = 0) uniform sampler2D u_tex_y;
-layout(set = 2, binding = 1) uniform sampler2D u_pal;
+layout(set = 0, binding = 0) uniform sampler2D uTexture[];
 
-layout(location = 0) in vec2 v_uv;
-layout(location = 0) out vec4 o_color;
+layout(location = 0) in vec2 inUV;
+layout(location = 1) flat in uint inId;
+layout(location = 0) out vec4 outColor;
 
 void main() {
-    o_color = texture(u_pal, vec2(texture(u_tex_y, v_uv).r, 0.5)).bgra;
+    outColor = texture(uTexture[nonuniformEXT(inId)], inUV);
 }

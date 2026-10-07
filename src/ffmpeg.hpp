@@ -323,15 +323,15 @@ public:
         if (!stream || !stream->metadata) {
             return "";
         }
-        
+
         // Look up the key in the stream's metadata dictionary
         AVDictionaryEntry* entry = av_dict_get(stream->metadata, key, nullptr, 0);
         if (entry && entry->value) {
             return std::string(entry->value);
         }
-        
+
         return "";
-    }    
+    }
 
     bool find_subtitle_stream()
     {
@@ -446,7 +446,7 @@ public:
 #ifdef _WIN32
     static enum AVPixelFormat negotiate_hw_format(AVCodecContext* ctx, const enum AVPixelFormat* choices) {
         const enum AVPixelFormat target_format = AV_PIX_FMT_D3D11;
-        
+
         for (const enum AVPixelFormat* p = choices; *p != AV_PIX_FMT_NONE; p++) {
             if (*p == target_format) {
                 // 1. Manually build the hardware frame configuration blueprint
@@ -454,30 +454,30 @@ public:
                 auto err = avcodec_get_hw_frames_parameters(ctx, ctx->hw_device_ctx, target_format, &hw_frames_ref);
                 if (!hw_frames_ref) {
                     // Failed to create configuration blueprints, fallback
-                    break; 
+                    break;
                 }
-                
+
                 // 2. Safely grab the context (this will no longer be nullptr!)
                 AVHWFramesContext* hw_frames = (AVHWFramesContext*)hw_frames_ref->data;
-                
+
                 // 3. Inject our cross-API shared handles instruction layers
                 AVD3D11VAFramesContext* d3d11_frames = (AVD3D11VAFramesContext*)hw_frames->hwctx;
                 d3d11_frames->MiscFlags |= D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
 //                d3d11_frames->BindFlags = D3D11_BIND_DECODER;
-                
+
                 // 4. Fire the frame pool allocator using your custom parameters
                 err = av_hwframe_ctx_init(hw_frames_ref);
                 if (err < 0) {
                     av_buffer_unref(&hw_frames_ref);
                     break;
                 }
-                
+
                 // 5. Hand the finalized, cross-API ready texture pool to the codec
                 ctx->hw_frames_ctx = hw_frames_ref; // Passes ownership to ctx
                 return target_format;
             }
         }
-        
+
         // Fallback if D3D11 fails to spin up
         return avcodec_default_get_format(ctx, choices);
     }
@@ -614,7 +614,7 @@ public:
             is_seeking = false;
             set_skip(AVDISCARD_DEFAULT, AVDISCARD_DEFAULT, AVDISCARD_DEFAULT);
         }
-    }    
+    }
 
     std::vector<ChapterData> read_chapters() {
         std::vector<ChapterData> chapter_list;
@@ -738,14 +738,14 @@ public:
                                 UINT slice = (UINT)(intptr_t)frame->data[1];
                                 D3D11_TEXTURE2D_DESC decoded_desc{};
                                 tex->GetDesc(&decoded_desc);
-                                
+
                                 d3dframe_pool.init(frame->width, frame->height, decoded_desc.Format);
                                 ID3D11Texture2D *new_tex = d3dframe_pool.alloc(d3d11_device.get());
                                 D3D11_BOX sourceBox{
                                     .right = (UINT) frame->width,
                                     .bottom = (UINT) frame->height,
                                     .back = 1
-                                };                                
+                                };
 
                                 d3d11_context->CopySubresourceRegion(new_tex, 0, 0, 0, 0, tex, slice, &sourceBox);
                                 d3d11_context->Signal(d3d11_fence.get(), ++fence_counter);
@@ -761,7 +761,7 @@ public:
                             AvFrameData data{
                                 .play_time = last_video_time,
                             };
-#ifdef _TEST                            
+#ifdef _TEST
                             if (frame->hw_frames_ctx) {
                                 auto err = av_hwframe_transfer_data(new_frame, frame, 0);
                                 if (err) av_err_log("av_hwframe_transfer_data", err);
@@ -828,12 +828,12 @@ public:
         return elapsed_time(now, shared_tp.load(std::memory_order_relaxed));
     }
 
-    inline double get_play_time() const {
-        return elapsed_time(shared_tp.load(std::memory_order_relaxed));
+    inline void set_play_time(double ts, time_point now) {
+        shared_tp.store(now - std::chrono::duration<double>(ts), std::memory_order_relaxed);
     }
 
     inline void set_play_time(double ts) {
-        shared_tp.store(std::chrono::steady_clock::now() - std::chrono::duration<double>(ts), std::memory_order_relaxed);
+        set_play_time(ts, std::chrono::steady_clock::now());
     }
 
     double time_next_frame() {
@@ -971,7 +971,7 @@ private:
             } else {
             }
     #endif
-/*    
+/*
             // handle vp9 memory corruption
             ID3D10Multithread* pMultithread = nullptr;
             if (SUCCEEDED(d3d11_device->QueryInterface(IID_PPV_ARGS(&pMultithread)))) {
